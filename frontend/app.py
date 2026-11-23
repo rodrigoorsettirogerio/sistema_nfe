@@ -25,6 +25,7 @@ import difflib
 import hashlib
 import html
 import json
+import os
 import re
 import time
 import unicodedata
@@ -43,22 +44,22 @@ st.set_page_config(page_title="Inteligência de Custos", page_icon="📊", layou
 
 # Base única da API local. `API_URL` mantém o nome histórico e aponta para a base;
 # o endpoint usado pelos relatórios fica em `RESUMO_PRECOS_URL`.
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = os.getenv("API_URL", "http://127.0.0.1:8000")
 API_URL = API_BASE
 RESUMO_PRECOS_URL = f"{API_BASE}/api/resumo-precos"
-AUDIT_URL = "http://127.0.0.1:8000/api/auditar"
-AUDIT_PENDENTE_URL = "http://127.0.0.1:8000/api/auditar/pendente"
-LIST_AUDIT_URL = "http://127.0.0.1:8000/api/auditados"
-LIST_AUDIT_PENDENTE_URL = "http://127.0.0.1:8000/api/auditados/pendentes"
-REGRAS_URL = "http://127.0.0.1:8000/api/regras-agrupamento"
+AUDIT_URL = f"{API_BASE}/api/auditar"
+AUDIT_PENDENTE_URL = f"{API_BASE}/api/auditar/pendente"
+LIST_AUDIT_URL = f"{API_BASE}/api/auditados"
+LIST_AUDIT_PENDENTE_URL = f"{API_BASE}/api/auditados/pendentes"
+REGRAS_URL = f"{API_BASE}/api/regras-agrupamento"
 # Memória de aprendizado (De-Para fornecedor + cProd) e embalagens — Auditoria.
-APRENDIZADO_URL = "http://127.0.0.1:8000/api/aprendizado-produtos"
+APRENDIZADO_URL = f"{API_BASE}/api/aprendizado-produtos"
 APRENDIZADO_REPROCESSAR_URL = f"{APRENDIZADO_URL}/reprocessar"
-NOTA_URL = "http://127.0.0.1:8000/api/nota"
+NOTA_URL = f"{API_BASE}/api/nota"
 # Relatórios gerenciais: a agregação acontece no backend e o front recebe só o resultado.
-RELATORIO_EVOLUCAO_URL = "http://127.0.0.1:8000/api/relatorio/evolucao"
-RELATORIO_COMPARATIVO_URL = "http://127.0.0.1:8000/api/relatorio/comparativo"
-RELATORIO_IMPACTO_URL = "http://127.0.0.1:8000/api/relatorio/impacto"
+RELATORIO_EVOLUCAO_URL = f"{API_BASE}/api/relatorio/evolucao"
+RELATORIO_COMPARATIVO_URL = f"{API_BASE}/api/relatorio/comparativo"
+RELATORIO_IMPACTO_URL = f"{API_BASE}/api/relatorio/impacto"
 
 
 
