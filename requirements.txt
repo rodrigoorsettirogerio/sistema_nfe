@@ -1,0 +1,41 @@
+# Dependências do sistema de inteligência de custos (NFe).
+# Instalação:  python -m pip install -r requirements.txt
+
+# API
+fastapi==0.162.2
+uvicorn==0.54.0
+SQLAlchemy==2.1.8
+pydantic==2.14.3
+
+# PostgreSQL em nuvem (a URL vem de DATABASE_URL; o SQLite segue como fallback local)
+psycopg2-binary==2.9.13
+
+# Autenticação (login por e-mail/senha + token JWT)
+passlib==1.7.4
+# O passlib 1.7.4 não reconhece o pacote bcrypt >= 4.1 (lê bcrypt.__about__, removido
+# no 4.1) e o hash da senha quebra com AttributeError. Mantenha o bcrypt fixado.
+bcrypt==4.0.1
+PyJWT==2.15.1
+
+# Front-end
+streamlit==1.67.0
+pandas==3.1.1
+# Exportação Excel do raio-x da base (pandas usa o openpyxl como engine .xlsx)
+openpyxl==3.1.5
+
+# HTTP (consulta de CNPJ na BrasilAPI e chamadas do front à API)
+requests==2.34.2
+
+# Leitura do .env local (DEEPSEEK_API_KEY e demais configurações do servidor)
+python-dotenv==1.2.4
+
+# Upload multipart do certificado digital A1 (st.file_uploader -> FastAPI File/Form)
+python-multipart==0.0.33
+
+# Leitura/validação do certificado .pfx/.p12 no vínculo das lojas
+cryptography==50.0.2
+
+# Autenticação em dois fatores (TOTP) da Auditoria + QR Code para o autenticador
+pyotp==2.9.0
+qrcode==8.2
+

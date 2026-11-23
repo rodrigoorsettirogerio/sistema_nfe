@@ -1,0 +1,30 @@
+# Caches do Python
+__pycache__/
+*.py[cod]
+
+# Segredo gerado no primeiro start da API para assinar os tokens JWT
+.secret_key
+
+# Variáveis de ambiente locais (chave da DeepSeek etc.) — nunca versionar
+.env
+
+# Logs locais
+*.log
+
+# Bancos SQLite locais (nunca versionar)
+*.db
+*.sqlite
+*.sqlite3
+
+# Ambiente virtual
+.venv/
+venv/
+
+# XMLs de NF-e baixados (histórico local, não vai pro repositório)
+xmls/
+
+# Artefatos de runtime e logs antigos
+*.pid
+*.anterior
+
+
