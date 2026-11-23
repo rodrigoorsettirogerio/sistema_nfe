@@ -112,6 +112,8 @@ MOCK = {
     "certificado_put": None,
     "config": None,
     "config_put": 0,
+    # Corpo de cada PUT /empresas/{cnpj}/distnfe, para conferir o que foi enviado.
+    "config_puts": [],
     "distribuicao": None,
     "distribuicoes": [],
     # Cursor que a ACBr espera receber em `dist_nsu` na próxima chamada.
@@ -341,7 +343,12 @@ class AcbrFake(BaseHTTPRequestHandler):
             return
         if caminho == f"/empresas/{CNPJ}/distnfe":
             dados = json.loads(self._corpo().decode("utf-8"))
+            # A ciência automática (210210) é o que libera o XML completo; o
+            # backend precisa reenviar o PUT quando a configuração atual ainda
+            # está com o campo desligado.
+            assert dados["ciencia_automatica"] is True, dados
             MOCK["config"] = dados
+            MOCK["config_puts"].append(dict(dados))
             MOCK["config_put"] += 1
             self._responder(200, dados)
             return
@@ -645,6 +652,69 @@ def _testar_sincronizacao_do_nsu_esperado():
         db.close()
 
 
+def _testar_ciencia_automatica_no_distnfe():
+    """O PUT /distnfe liga a ciência automática mesmo com o ambiente igual."""
+    from unittest.mock import patch
+
+    from backend import acbr_client
+
+    cliente = acbr_client.AcbrClient(
+        client_id="cliente-mock",
+        client_secret="segredo-mock",
+        api_url=BASE_ACBR,
+        auth_url=BASE_ACBR + "/token",
+    )
+    enviados = []
+
+    def fake_requisicao(metodo, caminho, **kwargs):
+        enviados.append((metodo, caminho, dict(kwargs.get("json") or {})))
+        return dict(kwargs.get("json") or {})
+
+    config_atual = {
+        "distribuicao_automatica": True,
+        "distribuicao_intervalo_horas": 12,
+        "ciencia_automatica": False,
+        "ambiente": "homologacao",
+    }
+
+    # Configuração existente com o MESMO ambiente, mas ciência desligada: o PUT
+    # precisa ser reenviado (era o early-return que impedia a correção).
+    with patch.object(
+        cliente, "consultar_configuracao_distribuicao_nfe", return_value=config_atual
+    ), patch.object(cliente, "_requisicao", side_effect=fake_requisicao):
+        cliente.configurar_distribuicao_nfe(CNPJ, "homologacao")
+
+    assert enviados, "o PUT deve ser reenviado quando a ciência está desligada"
+    metodo, caminho, corpo = enviados[-1]
+    assert metodo == "PUT", enviados
+    assert caminho == f"/empresas/{CNPJ}/distnfe", enviados
+    assert corpo["ciencia_automatica"] is True, corpo
+    assert corpo["ambiente"] == "homologacao", corpo
+    assert corpo["distribuicao_automatica"] is True, corpo
+    assert corpo["distribuicao_intervalo_horas"] == 12, corpo
+
+    # Já ligada e no mesmo ambiente: nada a reenviar (idempotente).
+    enviados.clear()
+    with patch.object(
+        cliente,
+        "consultar_configuracao_distribuicao_nfe",
+        return_value={**config_atual, "ciencia_automatica": True},
+    ), patch.object(cliente, "_requisicao", side_effect=fake_requisicao):
+        cliente.configurar_distribuicao_nfe(CNPJ, "homologacao")
+    assert enviados == [], enviados
+
+    # ACBR_CIENCIA_AUTOMATICA=0 desliga o manifesto automático.
+    enviados.clear()
+    with patch.dict(os.environ, {"ACBR_CIENCIA_AUTOMATICA": "0"}), patch.object(
+        cliente,
+        "consultar_configuracao_distribuicao_nfe",
+        return_value={**config_atual, "ciencia_automatica": True},
+    ), patch.object(cliente, "_requisicao", side_effect=fake_requisicao):
+        cliente.configurar_distribuicao_nfe(CNPJ, "homologacao")
+    assert enviados, "com o flag desligado o PUT deve desligar a ciência"
+    assert enviados[-1][2]["ciencia_automatica"] is False, enviados[-1]
+
+
 def main():
     import backend.database as bdatabase
     from backend.models import CodigoEmail, Empresa, Usuario
@@ -653,6 +723,7 @@ def main():
     _testar_payload_distribuicao_sem_datas_e_nsu_do_banco()
     _testar_sincronizacao_no_distribuir_nfe()
     _testar_sincronizacao_do_nsu_esperado()
+    _testar_ciencia_automatica_no_distnfe()
     servidor_mock = ThreadingHTTPServer(("127.0.0.1", PORTA_ACBR), AcbrFake)
     servidor_mock.daemon_threads = True
     threading.Thread(target=servidor_mock.serve_forever, daemon=True).start()
@@ -789,7 +860,14 @@ def main():
             "certificado_put"
         ].keys()
         assert MOCK["config"]["ambiente"] == "homologacao"
+        assert MOCK["config"]["ciencia_automatica"] is True, MOCK["config"]
 
+        # Empresa já configurada antes desta opção: a ACBr está com a ciência
+        # desligada e o ambiente é o mesmo. O próximo download precisa reenviar
+        # o PUT ligando `ciencia_automatica`, sem perder os demais campos.
+        MOCK["config"]["ciencia_automatica"] = False
+        MOCK["config"]["distribuicao_automatica"] = True
+        MOCK["config"]["distribuicao_intervalo_horas"] = 12
 
         baixados = requests.post(
             BASE_API + "/api/acbr/baixar-xmls",
@@ -847,7 +925,14 @@ def main():
         # mas descartado pelo filtro de período.
         assert MOCK["xml_baixados"] == ["doc-1", "doc-2"], MOCK["xml_baixados"]
         assert MOCK["token_requests"] == 1, MOCK["token_requests"]
-        assert MOCK["config_put"] == 1, MOCK["config_put"]
+        # 1º PUT no cadastro do certificado + 1 PUT no download, porque a ACBr
+        # estava com a ciência automática desligada e o ambiente não mudou.
+        assert MOCK["config_put"] == 2, MOCK["config_put"]
+        assert MOCK["config"]["ciencia_automatica"] is True, MOCK["config"]
+        assert MOCK["config"]["ambiente"] == "homologacao", MOCK["config"]
+        assert MOCK["config"]["distribuicao_automatica"] is True, MOCK["config"]
+        assert MOCK["config"]["distribuicao_intervalo_horas"] == 12, MOCK["config"]
+        assert MOCK["config_puts"][-1]["ciencia_automatica"] is True, MOCK["config_puts"]
         assert MOCK["distribuicao"]["cpf_cnpj"] == CNPJ, MOCK["distribuicao"]
         motivos = " | ".join(item["motivo"] for item in corpo_xmls["ignorados"])
         assert "fora do período" in motivos, motivos

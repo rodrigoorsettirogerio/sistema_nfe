@@ -15,6 +15,10 @@ Variáveis de ambiente:
 - `ACBR_SCOPES` (opcional): permissões do token, separadas por espaço
   (padrão `empresa distribuicao-nfe`, exigidas pelo cadastro da empresa e pelo
   download de XMLs);
+- `ACBR_CIENCIA_AUTOMATICA` (opcional): `0`/`false` desliga o manifesto
+  automático. Ligado por padrão, o `PUT /empresas/{cnpj}/distnfe` envia
+  `ciencia_automatica: true` e a própria ACBr API envia a "Ciência da
+  Operação" (210210) das notas recebidas;
 - `ACBR_TIMEOUT` (opcional): segundos, padrão 30.
 
 O token fica em memória e é reutilizado até perto do vencimento (`expires_in`).
@@ -86,6 +90,20 @@ class AcbrNaoConfigurado(ErroAcbr):
 def _valor_ambiente(nome: str, padrao: str = "") -> str:
     """Lê uma variável e remove espaços acidentais nas pontas."""
     return (os.getenv(nome) or padrao).strip()
+
+
+def _ciencia_automatica_habilitada() -> bool:
+    """Lê ``ACBR_CIENCIA_AUTOMATICA`` (padrão ligado).
+
+    Ligado, ``configurar_distribuicao_nfe`` envia ``ciencia_automatica: true``
+    no ``PUT /empresas/{cnpj}/distnfe``: a ACBr API manifesta a "Ciência da
+    Operação" (210210) das notas recebidas em qualquer forma de distribuição e
+    libera o XML completo (procNFe). ``ACBR_CIENCIA_AUTOMATICA=0`` (ou
+    ``false``/``off``) desliga o manifesto automático sem mudar o restante da
+    configuração.
+    """
+    texto = _valor_ambiente("ACBR_CIENCIA_AUTOMATICA", "1").lower()
+    return texto not in {"0", "false", "nao", "não", "off", "desligado"}
 
 
 def _json_ou_texto(resposta: requests.Response) -> Any:
@@ -700,8 +718,17 @@ class AcbrClient:
     ) -> Dict[str, Any]:
         """Garante a configuração do serviço de Distribuição NF-e da empresa.
 
+        O ``PUT /empresas/{cnpj}/distnfe`` envia ``ciencia_automatica: true``
+        (padrão; ``ACBR_CIENCIA_AUTOMATICA=0`` desliga): assim a própria ACBr
+        API envia a "Ciência da Operação" (210210) das notas recebidas, em
+        qualquer forma de distribuição, e o XML completo (procNFe) passa a ser
+        liberado.
+
         Quando já existe configuração, preserva as opções atuais (distribuição
-        automática/ciência automática) e só troca o ambiente se ele divergir.
+        automática/intervalo) e só troca o ambiente se ele divergir. O ``PUT``
+        também é reenviado quando a ciência automática ainda está desligada na
+        ACBr — sem isso, empresas configuradas antes desta opção nunca
+        receberiam a manifestação.
         """
         cnpj = _so_digitos(cpf_cnpj)
         if len(cnpj) != 14:
@@ -709,6 +736,8 @@ class AcbrClient:
         alvo = ambiente or self.ambiente_distribuicao
         if alvo not in {"homologacao", "producao"}:
             raise ValueError("Ambiente inválido: use 'homologacao' ou 'producao'.")
+
+        ciencia_desejada = _ciencia_automatica_habilitada()
 
         atual: Optional[Dict[str, Any]] = None
         try:
@@ -718,7 +747,9 @@ class AcbrClient:
                 raise
 
         if atual:
-            if str(atual.get("ambiente") or "") == alvo:
+            ambiente_atual = str(atual.get("ambiente") or "")
+            ciencia_atual = bool(atual.get("ciencia_automatica", False))
+            if ambiente_atual == alvo and ciencia_atual == ciencia_desejada:
                 return atual
             corpo = {
                 "distribuicao_automatica": bool(
@@ -727,13 +758,13 @@ class AcbrClient:
                 "distribuicao_intervalo_horas": int(
                     atual.get("distribuicao_intervalo_horas") or 24
                 ),
-                "ciencia_automatica": bool(atual.get("ciencia_automatica", False)),
+                "ciencia_automatica": ciencia_desejada,
                 "ambiente": alvo,
             }
         else:
             corpo = {
                 "distribuicao_automatica": False,
-                "ciencia_automatica": False,
+                "ciencia_automatica": ciencia_desejada,
                 "ambiente": alvo,
             }
         return self._requisicao("PUT", f"/empresas/{cnpj}/distnfe", json=corpo)
