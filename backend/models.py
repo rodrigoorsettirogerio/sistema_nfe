@@ -95,6 +95,17 @@ class Empresa(Base):
     # Último NSU já consumido na Distribuição NF-e da ACBr. "0" (ou NULL) significa
     # que a loja nunca baixou nada; o primeiro download usa 7 dias por padrão.
     ultimo_nsu_acbr = Column(String, nullable=True, default="0")
+    # ── Integração com a API do Omie (fase 2: importação dos recebimentos) ─────
+    # `app_key`/`app_secret` são do aplicativo criado em app.omie.com.br e ficam
+    # CRIPTOGRAFADOS no banco (backend/cripto_credenciais.py): o valor gravado é
+    # "fernet:v1:<token>", nunca o segredo em texto. A chave de criptografia vem de
+    # OMIE_ENC_KEY (ou NFE_SECRET_KEY/.secret_key) e NÃO é gravada aqui — um dump do
+    # banco sozinho não permite chamar a API em nome da loja. NULL = integração
+    # desligada para esta empresa (o sincronizador aceita as credenciais do .env).
+    omie_app_key = Column(String)
+    omie_app_secret = Column(String)
+    # ISO 8601 UTC da última sincronização concluída (relatório/agendador da fase 3).
+    omie_sync_em = Column(String)
     notas = relationship("NotaFiscal", back_populates="empresa")
 
 class Fornecedor(Base):

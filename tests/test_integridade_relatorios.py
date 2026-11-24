@@ -116,7 +116,7 @@ from backend import certificados as bcerts
 from backend import ia_consenso
 from backend import main as bmain
 from backend import aprendizado_produtos as baprendizado
-from backend.database import DB_PATH, SessionLocal
+from backend.database import DB_PATH, SessionLocal, init_db
 from backend.models import (
     Base,
     CodigoEmail,
@@ -155,6 +155,10 @@ def _sessao_copia(diretorio):
     copia = Path(diretorio) / "copia_integridade.db"
     shutil.copy(DB_PATH, copia)
     engine = create_engine("sqlite:///" + str(copia).replace("\\", "/"))
+    # Aplica na CÓPIA as migrações aditivas do start da API: assim o teste funciona
+    # mesmo quando a base real ainda não recebeu uma coluna nova (ex.: as credenciais
+    # Omie de empresas).
+    init_db(engine)
     return sessionmaker(bind=engine)(), engine
 
 

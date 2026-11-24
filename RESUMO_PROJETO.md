@@ -51,6 +51,7 @@ Dependências principais (`requirements.txt`):
 Presentes hoje: `DEEPSEEK_API_KEY`, `ACBR_CLIENT_ID`, `ACBR_CLIENT_SECRET`, `ACBR_AMBIENTE`, `ACBR_AUTH_URL`, `ACBR_API_URL`, `ACBR_SCOPES`, `DIAS_PRIMEIRO_DOWNLOAD`.
 Opcionais previstas no código: `ACBR_TIMEOUT`, `DEEPSEEK_MODEL`, `DEEPSEEK_API_URL`, `DEEPSEEK_TIMEOUT`, `NFE_SECRET_KEY`, `NFE_TOKEN_HORAS`, `NFE_2FA_HORAS`.
 Alertas/consultas: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_NAME`, `SMTP_TIMEOUT`, `NFE_SMTP_DESATIVADO` (teste), `NFE_ALERTAS_AGENDADOR` (`0` desliga a thread), `NFE_ALERTAS_HORA` (0-23, padrão 6), `NFE_ESPERA_ENTRE_PROVEDORES` (pausa ao trocar de provedor do CNPJ, padrão 1 s), `NFE_CACHE_CADASTRAL_HORAS` (TTL do cache de CNPJ/CEP, padrão 720 h).
+Omie: `OMIE_APP_KEY`/`OMIE_APP_SECRET` (credencial de fallback quando a loja não tem a sua; `testar_omie_sync.py --gravar-credenciais` grava a da loja cifrada), `OMIE_ENC_KEY` (chave do Fernet; sem ela o módulo usa `NFE_SECRET_KEY` ou o `.secret_key`), `OMIE_TIMEOUT` (segundos por chamada, padrão 60).
 
 `.gitignore` protege `.env`, `.secret_key`, `__pycache__/`, `*.py[cod]` e `*.log`. **Ainda não existe repositório Git inicializado** (`git status` retorna “SEM_GIT”).
 
@@ -68,7 +69,10 @@ sistema_nfe_pro/
 │   ├── database.py              # engine SQLite, SessionLocal, init_db e migrações aditivas
 │   ├── auth.py                  # hash de senha, JWT, 2FA TOTP, dependências de admin
 │   ├── certificados.py          # validação do .pfx/.p12, titular/CNPJ/validade
+│   ├── cripto_credenciais.py    # Fernet/PBKDF2 dos segredos de integração gravados no banco
 │   ├── acbr_client.py           # cliente OAuth2 ACBr: empresa, certificado, distribuição e XMLs
+│   ├── omie_client.py           # cliente HTTP Omie: ListarRecebimentos, ListarDocumentos (XML)
+│   ├── omie_sync.py             # recebimentos Omie → fornecedor/nota/itens (dedupe por chave)
 │   ├── marcas.py                # heurística local de marca por variação de NCM
 │   ├── ia_consenso.py           # DeepSeek: marcas, ambiguidade, sugestões de correção, cache
 │   ├── aprendizado_produtos.py  # embalagens, de-para fornecedor+cProd, sincronização
@@ -96,6 +100,7 @@ sistema_nfe_pro/
 │   ├── test_verificacao_email.py       # cadastro/confirmação de e-mail
 │   ├── test_marcas.py                  # script de validação da inteligência de marcas
 │   ├── test_marcas_master.py           # 7 testes do catálogo mestre/cache
+│   ├── test_omie_sync.py               # sincronização Omie offline (cliente falso, SQLite temporário)
 │   └── _verificar_auditoria_tmp.py     # inspeção temporária da tela de Auditoria
 ├── xmls/                        # XMLs locais de NF-e (grande volume, dados de operação)
 ├── import_xmls.py               # importador principal dos XMLs
@@ -114,9 +119,13 @@ sistema_nfe_pro/
 ├── atualizar_nsu_manual.py      # lê os XMLs antigos e grava o maior NSU por loja
 ├── limpar_certificados_teste.py # limpa certificados de teste (script operacional)
 ├── testar_acbr.py               # teste manual de autenticação/CEP na ACBr
+├── testar_omie.py               # teste manual do cliente Omie (listagem/XML, sem banco)
+├── testar_omie_sync.py          # sincronização Omie real (--simular/--gravar-credenciais)
+├── diagnostico_omie_cetapa.py   # diagnóstico: quantos recebimentos por etapa/período
+├── diagnostico_omie_xml.py      # diagnóstico: compara recebimento do Omie com o XML local
 ├── ver_empresas.py              # lista empresas do banco
 ├── requirements.txt
-├── .env                         # segredos locais (IGNORADO pelo Git)
+├── .env                         # segredos locais (IGNORADO pelo Git): OMIE_APP_KEY/SECRET, OMIE_ENC_KEY
 ├── .secret_key                  # segredo JWT gerado no primeiro start (IGNORADO)
 └── RESUMO_PROJETO.md            # este documento
 ```
@@ -124,7 +133,7 @@ sistema_nfe_pro/
 ### Tabelas principais
 
 - `usuarios`: conta, hash de senha, `is_admin`, segredo/estado do 2FA.
-- `empresas`: CNPJ, nomes, `usuario_id` (dono) e dados públicos do certificado.
+- `empresas`: CNPJ, nomes, `usuario_id` (dono), dados públicos do certificado, cursor `ultimo_nsu_acbr` e as credenciais Omie **cifradas** (`omie_app_key`/`omie_app_secret`) + `omie_sync_em` (última sincronização).
 - `fornecedores`, `notas_fiscais`, `itens_nota`: NF-e, itens crus e campos derivados (`cfop`, `marca`, `c_prod`, `unidade_compra`, `qtd_por_embalagem`, unidades/base).
 - `mapeamento_fornecedor_produtos`: memória de-para por CNPJ do fornecedor + `cProd`, com `origem` automática/manual.
 - `itens_auditados`: chave aprovada ou pendente (`auditado` + `motivo` manual/aberrante).
@@ -274,6 +283,62 @@ sistema_nfe_pro/
 - Cache em memória (por processo) de resposta boa por `NFE_CACHE_CADASTRAL_HORAS` (padrão 720 h = 30 dias); falha nunca é cacheada. `NFE_ESPERA_ENTRE_PROVEDORES=0` deixa os testes instantâneos.
 - O cadastro (`_consultar_cnpj_brasilapi`) mantém o cache de processo e o contrato antigo (`fonte="brasilapi"`, `None` quando nenhum provedor responde), então a ACBr continua recebendo o endereço mesmo com a BrasilAPI fora do ar.
 
+### 4.10 Integração Omie (notas de entrada)
+
+**Fase 1 — cliente HTTP (`backend/omie_client.py`).** A API do Omie não usa OAuth: toda chamada é um `POST` JSON `{"call", "app_key", "app_secret", "param"}`. Dois métodos implementados:
+
+- `ListarRecebimentos` (`/api/v1/produtos/recebimentonfe/`): notas de entrada já lançadas, com `cExibirDetalhes="S"` (traz itens/parcelas/`infoCadastro`), filtro por **data de emissão** (`dtEmissaoDe`/`dtEmissaoAte`, opcionais) e `cEtapa` do kanban (40 Faturado, 60 Recebido, 80 Conferido).
+- `ListarDocumentos` (`/api/v1/contador/xml/`): XML completo em `cXml`; `cModelo="55"` e `cOperacao="0"` são obrigatórios para vir **entrada** (o default do Omie é `1` = saída).
+
+Erro em dois níveis (HTTP 2xx não basta): status fora de 2xx vira `ErroOmie` com o corpo preservado e, com HTTP 200, `omie_fail`/`cCodStatus != "0"` também viram `ErroOmie` (sem isso uma recusa apareceria como “nenhuma nota”). A Omie responde **HTTP 425** em rajadas de chamadas, por isso `INTERVALO_ENTRE_PAGINAS = 1.0` entre páginas. `OMIE_TIMEOUT` (padrão 60 s) e `testar_omie.py` permitem smoke sem banco.
+
+**Credenciais por loja (`backend/cripto_credenciais.py`).** `empresas.omie_app_key`/`omie_app_secret` guardam o texto **cifrado** com Fernet (AES-128-CBC + HMAC, via PBKDF2-HMAC-SHA256 sobre `OMIE_ENC_KEY` > `NFE_SECRET_KEY` > `.secret_key`), no formato `fernet:v1:<token>`; valor antigo em texto puro é devolvido como está e a migração é idempotente. Chave trocada levanta `InvalidToken` → `ErroCredenciais` com instrução de re-gravação (nunca devolve segredo pela metade). Leitura: credencial da **loja** tem prioridade; sem ela cai em `OMIE_APP_KEY`/`OMIE_APP_SECRET` do `.env`, e o resultado informa `origem_credenciais` (`empresa`/`ambiente`).
+
+**Fase 2 — importação (`backend/omie_sync.py`).** `sincronizar_recebimentos(db, empresa, *, data_inicio, data_fim, dias, etapas, cliente, confirmar, recalcular_marcas_itens, atualizar_sync_em)` percorre as etapas e grava fornecedor/nota/itens na base do sistema, devolvendo contadores (`novas`, `duplicadas`, `canceladas`, `ignoradas`, `bonificados`, `notas_sem_itens`, `mapeamentos_*`, `itens`, `erros`, `etapas`, `origem_credenciais`, `simulado`, `sincronizado_em`).
+
+| Campo do Omie | Destino |
+|---|---|
+| `cabec.cChaveNFe` (44 dígitos) | `notas_fiscais.chave_acesso` — identidade da nota (dedupe); sem 44 dígitos o recebimento é ignorado com aviso |
+| `cabec.cNumeroNFe` / `cSerieNFe` | `numero_nota` / `serie` (sem zeros à esquerda; série vazia → `"1"`) |
+| `cabec.dEmissaoNFe` (fallback `infoCadastro.dFat`) | `data_emissao` |
+| `cabec.nValorNFe` (fallback `totais.vTotalNFe`) | `valor_total` |
+| `cabec.cCNPJ_CPF` / `cRazaoSocial` (fallback `cNome`) | `fornecedores.cnpj` / `nome` (criado/reaproveitado por CNPJ, com cache na execução) |
+| `infoCadastro.cCancelada = "S"` | nota **não** é gravada (contador `canceladas`) |
+| `itensCabec.cCodigoProduto` | `itens_nota.c_prod` |
+| `itensCabec.cDescricaoProduto` | `descricao_produto` (item sem descrição é descartado) |
+| `itensCabec.cEAN` | `ean` (mesma regra do importador de XML: vazio/“SEM GTIN” → `SEM_EAN`, zeros à esquerda removidos) |
+| `itensCabec.cNCM` / `cCFOP` | `ncm` / `cfop` (só dígitos, como no XML) |
+| `cUnidadeNfe` / `itensAjustes.cUnidade` | `unidade_compra` |
+| `nQtdeNFe` / `nPrecoUnit` / `vTotalItem` / `vDesconto` | `quantidade` / `valor_unitario` / `valor_total` — **valores crus**, para auditoria |
+| embalagem (`interpretar_embalagem`) + `normalizar_quantidades` | `qtd_por_embalagem`, `unidade_base`, `quantidade_base`, `valor_unitario_base` |
+
+Regras de negócio aplicadas:
+
+- **Dedupe por chave**: a mesma nota vista em etapas diferentes (40/60/80) ou já existente no banco conta como `duplicadas` e não cria linha nova; o cabeçalho é commitado antes dos itens (uma falha de item não faz a nota “desaparecer” da próxima execução).
+- **Bonificação/doação/brinde** (CFOP 5910/6910, preço 0, desconto integral ou termo BONIFIC/BRINDE/DOACAO na descrição) não entra em preço: vai para `bonificados`; nota só com bonificação é mantida (dedupe) e contada em `notas_sem_itens`.
+- **De-para**: usa `mapeamento_fornecedor_produtos` (CNPJ do fornecedor + `cProd`) carregado uma vez por execução, aplica `aplicar_identidade`/`aplicar_embalagem_aprendida` e registra o aprendizado dos itens novos.
+- **Marcas**: depois da importação chama `recalcular_marcas(db, apenas_cache=True)` (nenhuma chamada de IA), controlado por `recalcular_marcas_itens`.
+- **`omie_sync_em`**: gravado em ISO 8601 UTC ao fim de uma execução real.
+- **Simulação (`confirmar=False`)**: faz `flush` a cada nota (validando constraints) e `rollback()` no fim — nenhuma linha permanece no banco.
+
+**Scripts de operação.**
+
+```powershell
+# grava as credenciais da loja (cifradas) e encerra
+python testar_omie_sync.py --gravar-credenciais --cnpj 12345678000199
+
+# valida tudo sem gravar (rollback no fim; nada de rede além da API do Omie)
+python testar_omie_sync.py --simular --dias 7
+
+# importa de fato (padrão: hoje - 30 dias, etapas 40/60/80)
+python testar_omie_sync.py
+python testar_omie_sync.py --tudo --etapas 40,60,80 --sem-marcas
+```
+
+`--cnpj` escolhe a loja (sem ele, só roda se houver **uma** loja cadastrada; com várias, lista as opções e falha), `--data-inicio`/`--data-fim` (dd/mm/aaaa) substituem `--dias` e `--tudo` importa o histórico inteiro. Códigos de saída: `0` sucesso, `1` falha de configuração/credencial/loja, `2` concluiu com erros por nota/etapa (nestes casos `--simular` também sai com `2` e avisa que a simulação teve erros).
+
+**Ainda não existe** rota de API nem tela para o Omie (fase 3): hoje a credencial é gravada e a sincronização é disparada pelos scripts acima.
+
 ---
 
 ## 5. Estado atual dos dados (banco real em 17/11/2026)
@@ -334,11 +399,22 @@ python tests/test_marcas_master.py
 # SMTP (falso) e confirmação de e-mail
 python tests/test_email_service.py
 python tests/test_verificacao_email.py
+
+# Sincronização Omie sem rede (cliente falso + SQLite temporário)
+python tests/test_omie_sync.py
+
+# Migração SQLite -> PostgreSQL (destino temporário; só lê a base real)
+python tests/test_migracao_postgres.py
 ```
 
 ### Último resultado registrado
 
 - `python -m py_compile` de todos os módulos (backend, front, testes): **OK**.
+- `tests/test_omie_sync.py`: **OK** — migração aditiva idempotente das colunas Omie, credenciais Fernet (cifra, lê de volta, origem loja/ambiente, erro de chave trocada), sincronização real contra `ClienteFalso` (mapeamento de chave/número/série/data/valor/fornecedor/EAN/NCM/CFOP, valores crus vs `*_base`, bonificação ignorada, cancelada não gravada, dedupe na segunda execução, `--simular` = rollback), tudo em SQLite temporário e sem rede.
+- `tests/test_migracao_postgres.py`: **passou** (cópia com as colunas novas, IDs/contagens preservados).
+- `tests/test_multitenancy_lojas.py`: **9/9** (inclui as colunas novas de `empresas`).
+- `tests/test_marcas.py` e `tests/test_integridade_relatorios.py` agora chamam `init_db(engine)` na **cópia** do banco, então a cópia nasce com as migrações aditivas (antes a suíte quebrava em `no such column: empresas.omie_app_key`); a base real continua intocada. A suíte principal continua exigindo a API ligada.
+- `testar_omie_sync.py` validado por harness fora do repositório (base temporária): `--gravar-credenciais` cifra e relê, `--simular` não grava, execução real importa/deduplica, CNPJ inexistente sai com `1`, parsers de `--etapas`/data/`--dias` e `--help` OK.
 - Suíte principal: **74/74 testes passaram** (inclui os AppTests de Minhas Lojas/alertas, que exigem a API ligada).
 - `tests/test_alertas_relatorio.py`: **16/16** (inclui o relatório de período com média e o tooltip listando todas as compras); `tests/test_inflacao.py`: **9/9**; `tests/test_email_service.py`: **8/8** (inclui `multipart/alternative` texto + HTML); `tests/test_acbr_endereco.py`: **11/11** (429 troca de provedor); `tests/test_multitenancy_lojas.py`: **6/6**; `tests/test_marcas*.py`, `test_acbr_rotas.py`, `test_acbr_auto_import.py` e `test_verificacao_email.py`: passaram.
 - Relatório real (banco de produção, conta do admin): diário → 12 itens/1 nota, 9 variações, impacto **+R$ 15,35/mês**; semanal → 38 itens/14 notas, 17 variações (+R$ 219,69/mês); mensal → 591 itens/183 notas, 86 variações (+R$ 1.122,89/mês). Índice de inflação do mês fechado (out/26): **+2,92 %**, cobertura **76 %**; prévia de 30 dias **+0,10 %**, cobertura **62,8 %** — números coerentes entre si e com as compras do período.
@@ -365,6 +441,16 @@ Arquivos alterados nesta frente: `backend/ia_consenso.py`, `backend/main.py`, `f
 5. **Testes:** atualizados os AppTests/alertas e criados `test_alertas_relatorio.py` e `test_inflacao.py`.
 
 Arquivos alterados nesta frente: `backend/consulta_cadastral.py` (novo), `backend/relatorios_alerta.py` (novo), `backend/inflacao.py` (novo), `backend/agendador.py` (novo), `backend/main.py`, `backend/models.py`, `backend/database.py`, `backend/alertas.py`, `backend/email_service.py`, `frontend/app.py`, `tests/*` e este resumo.
+
+### Frente Omie — fases 1 e 2 (24/11/2026)
+
+1. **Cliente HTTP** (`backend/omie_client.py`): `ListarRecebimentos` (detalhado, filtro por emissão e etapa) e `ListarDocumentos` (XML completo de entrada), com erro em dois níveis e pausa entre páginas por causa do HTTP 425.
+2. **Credenciais cifradas por loja** (`backend/cripto_credenciais.py` + colunas em `empresas`): Fernet/PBKDF2, prefixo `fernet:v1:`, migração aditiva idempotente em `init_db`, fallback para o `.env` e erro claro quando a chave de criptografia muda.
+3. **Sincronização** (`backend/omie_sync.py`): recebimentos do Omie → `fornecedores`/`notas_fiscais`/`itens_nota`, com dedupe por chave, descarte de canceladas e bonificações, de-para por fornecedor+`cProd`, valores crus + `*_base`, `omie_sync_em`, modo simulação e recálculo de marcas só por cache.
+4. **Scripts**: `testar_omie.py` (cliente, sem banco), `testar_omie_sync.py` (`--simular`, `--gravar-credenciais`, `--cnpj`, `--dias`/`--data-inicio`/`--data-fim`/`--tudo`, `--etapas`, `--sem-marcas`) e os diagnósticos `diagnostico_omie_cetapa.py`/`diagnostico_omie_xml.py`.
+5. **Testes**: `tests/test_omie_sync.py` (offline, cliente falso) e `init_db(engine)` na cópia usada por `test_marcas.py`/`test_integridade_relatorios.py`.
+
+Arquivos novos/alterados nesta frente: `backend/omie_client.py`, `backend/omie_sync.py`, `backend/cripto_credenciais.py`, `backend/models.py`, `backend/database.py`, `testar_omie.py`, `testar_omie_sync.py`, `tests/test_omie_sync.py`, `tests/test_marcas.py`, `tests/test_integridade_relatorios.py` e este resumo.
 
 ---
 
@@ -395,28 +481,32 @@ Arquivos alterados nesta frente: `backend/consulta_cadastral.py` (novo), `backen
    - `POST /api/acbr/empresas` agenda download + importação em background; a importação é incremental e deduplica por chave (`tests/test_acbr_auto_import.py`).
    - Continua faltando um agendador periódico para atualizar o NSU sem novo cadastro de certificado; hoje o fluxo é disparado pelo cadastro/reenvio do certificado ou pela rota manual.
 
+7. **Integração Omie — fase 3 (rotas e tela).**
+   - A fase 2 entrega o backend e os scripts; falta expor na API (`POST /api/omie/credenciais`, `POST /api/omie/sincronizar`, `GET /api/omie/status/{cnpj}`) e uma tela em **Minhas Lojas** (campos `app_key`/`app_secret` que nunca voltam inteiros, botão sincronizar com resumo e `omie_sync_em`).
+   - Definir também se a sincronização será agendada (como o NSU da ACBr) e qual o recorte padrão por loja.
+
 ### P2 — operação, qualidade e infraestrutura
 
-7. **Configuração de ambiente no front.**
+8. **Configuração de ambiente no front.**
    - `frontend/app.py` fixa `http://127.0.0.1:8000`. Parametrizar por variável de ambiente/`.streamlit/secrets.toml`, com validação e mensagem amigável quando a API estiver indisponível.
 
-8. **Versionamento e CI.**
+9. **Versionamento e CI.**
    - Não há repositório Git inicializado, pipeline, lint ou testes automatizados em CI. Também não há Alembic: as migrações são SQL aditivo em `init_db()`.
    - Recomendado: `git init`, branch protection, CI rodando `py_compile`, suítes de marcas/ACBr e a suíte principal contra um banco temporário.
 
-9. **Infraestrutura e confiabilidade.**
+10. **Infraestrutura e confiabilidade.**
    - SQLite é adequado ao volume atual, mas tem limitações de concorrência/backup. Definir rotina de backup, restauração testada, retenção de logs e monitoramento (erros 5xx, tempo de resposta, falhas de IA/ACBr).
    - Não há Docker/systemd/HTTPS documentado; a API sobe em HTTP local.
 
-10. **Limpeza de código legado.**
+11. **Limpeza de código legado.**
     - `backend/processar_lote.py` **apaga** `../sistema_nfe_pro.db` antes de reprocessar. É perigoso e não deve ser executado.
     - `backend/xml_parser.py`, `backend/testar_parser.py`, `tests/_verificar_auditoria_tmp.py` e `sistema_nfe_pro.db` (0 bytes) são resíduos de desenvolvimento: mover para uma pasta `legacy/` ou remover, com registro no README.
     - `api.log`, `api.err.log`, `uvicorn_teste*.log` e `.uvicorn_teste.pid` são artefatos locais; não versionar.
 
-11. **Custos/observabilidade da IA.**
+12. **Custos/observabilidade da IA.**
     - Já existe cache e limite por lote, mas falta registrar custo/tokens por execução, aplicar orçamento máximo, retentativa com backoff e trilha de auditoria das decisões da IA.
 
-12. **Qualidade dos dados.**
+13. **Qualidade dos dados.**
     - As 7 chaves legadas de aberração devem ser revisadas/aprovadas na tela após o deploy da correção; depois, conferir se o aviso some e se o Impacto volta a somar os itens validados.
     - Rodar os backfills pendentes (`backfill_relatorios.py`, `backfill_aprendizado.py`, `backfill_marcas.py`) quando houver importação antiga fora do fluxo.
 
@@ -438,6 +528,12 @@ Arquivos alterados nesta frente: `backend/consulta_cadastral.py` (novo), `backen
 - [ ] Parametrizar a URL da API no front; remover `127.0.0.1` fixo.
 - [ ] Definir CORS/HTTPS, rate limiting no login/2FA e política de bloqueio por tentativas.
 - [ ] Revisar exposição de logs, segredos e mensagens de erro.
+
+### Sprint 1.5 — Omie fase 3 (rotas + tela)
+
+- [ ] `POST /api/omie/credenciais` (grava cifrado, devolve só os 4 últimos caracteres), `POST /api/omie/sincronizar` (dispara o sync da loja e devolve o resumo) e `GET /api/omie/status/{cnpj}` (`omie_sync_em`, origem da credencial, última execução).
+- [ ] Tela em **Minhas Lojas**: campos de `app_key`/`app_secret`, botão **🔄 Sincronizar Omie** com resumo (novas/duplicadas/itens/erros) e teste em `--simular` antes de gravar.
+- [ ] Definir agendamento (mesma lógica do NSU da ACBr) e recorte padrão (dias/etapas) por loja.
 
 ### Sprint 2 — alertas reais
 
@@ -474,6 +570,8 @@ Arquivos alterados nesta frente: `backend/consulta_cadastral.py` (novo), `backen
 8. **2FA do admin é fail-closed**; conta comum não acessa Auditoria nem por API.
 9. **Certificado e senha não vão para o banco** (apenas dados públicos).
 10. **Uma única fonte de itens** para relatórios e alertas (`_carregar_itens_relatorio`), garantindo os mesmos excluídos.
+11. **Credencial Omie é segredo**: no banco só entra cifrada (`fernet:v1:`); nenhuma rota/script imprime `app_secret` e a leitura prefere a loja ao `.env`.
+12. **A mesma nota nunca entra duas vezes**: a chave de 44 dígitos é a identidade — vale para XML, ACBr e Omie, inclusive entre etapas do kanban.
 
 ---
 
@@ -490,6 +588,7 @@ Com a API em `:8000` e o Streamlit rodando:
 7. **Minhas Lojas**: cadastrar/consultar CNPJ, testar certificado inválido (deve bloquear) e exclusão do certificado.
 8. **Alertas**: salvar configuração, simular mensagem e conferir aumentos/quedas/divergências e divisão em partes.
 9. **ACBr**: rodar `python tests/test_acbr_rotas.py`; opcionalmente `python testar_acbr.py` para autenticação real no sandbox.
+10. **Omie**: `python tests/test_omie_sync.py` (offline) e depois `python testar_omie_sync.py --simular --dias 3 --cnpj <CNPJ>` — conferir o resumo e se a base não mudou (`omie_sync_em` só avança sem `--simular`).
 
 ---
 
@@ -504,6 +603,7 @@ Com a API em `:8000` e o Streamlit rodando:
 - As rotas de relatório não têm isolamento por conta no backend (item P0).
 - A suíte principal usa o banco real e a API no ar; alguns testes são sensíveis ao estado dos dados.
 - O front fala com um único endereço local fixo.
+- A integração Omie (fases 1 e 2) só existe por script: não há rota, tela nem agendador — e o recorte de etapas/período é definido na linha de comando.
 - Não há Git, CI, container, HTTPS ou migrações versionadas.
 
 ---
@@ -516,6 +616,8 @@ Com a API em `:8000` e o Streamlit rodando:
 4. A importação ACBr deve ser automática após o download ou continuar como ação explícita do usuário?
 5. Qual o SLA/orçamento mensal de IA e qual o comportamento ao estourar (parar, usar só cache, avisar admin)?
 6. O que fazer com as 45 sugestões antigas: consolidar automaticamente ou manter histórico completo para auditoria?
+7. Omie: a sincronização oficial é só por `recebimentos` (etapas 40/60/80) ou também traz notas ainda não lançadas? E cada loja tem uma conta Omie própria (credencial por `empresas`) ou uma conta do grupo?
+8. Omie: o que fazer quando a mesma nota já existe pelo XML da ACBr (mantém, atualiza preço/fornecedor ou só marca como conferida)?
 
 ---
 

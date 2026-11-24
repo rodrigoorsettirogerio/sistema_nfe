@@ -234,6 +234,11 @@ def _garantir_colunas_novas(conexao):
       vínculo da loja (titular, validade e data do envio);
     - empresas.ultimo_nsu_acbr: último NSU consumido na Distribuição NF-e da ACBr.
       "0" (ou NULL) marca a primeira consulta (DIAS_PRIMEIRO_DOWNLOAD, padrão 7);
+    - empresas.omie_app_key / omie_app_secret / omie_sync_em: integração com a API
+      do Omie (fase 2, backend/omie_sync.py). As duas credenciais guardam o texto
+      CRIPTOGRAFADO ("fernet:v1:...", backend/cripto_credenciais.py) e nascem NULL
+      — loja sem credencial usa OMIE_APP_KEY/OMIE_APP_SECRET do .env. `omie_sync_em`
+      é o ISO 8601 UTC da última sincronização concluída;
     - empresas.logradouro/numero/complemento/bairro/codigo_municipio/uf/cep: endereço
       fiscal completo, gravado no vínculo da loja e usado como fallback quando a
       BrasilAPI estiver indisponível no cadastro da ACBr;
@@ -326,6 +331,14 @@ def _garantir_colunas_novas(conexao):
         "UPDATE empresas SET ultimo_nsu_acbr = '0' "
         "WHERE ultimo_nsu_acbr IS NULL OR TRIM(ultimo_nsu_acbr) = ''"
     )
+
+    # ── Credenciais da integração Omie (fase 2) ────────────────────────────────
+    # As colunas guardam o texto CIFRADO ("fernet:v1:...") — o segredo em texto
+    # nunca é gravado. Nascem NULL: a loja que não configurou a integração usa as
+    # credenciais OMIE_APP_KEY/OMIE_APP_SECRET do .env (backend/omie_sync.py).
+    for coluna in ("omie_app_key", "omie_app_secret", "omie_sync_em"):
+        if coluna not in _colunas(conexao, "empresas"):
+            executar(f"ALTER TABLE empresas ADD COLUMN {coluna} TEXT")
 
     # Endereço fiscal da loja (cadastro na ACBr). Colunas criadas depois da
     # primeira versão do banco; as lojas antigas são preenchidas no próximo

@@ -31,7 +31,7 @@ from sqlalchemy.orm import sessionmaker
 
 from backend import main as bmain
 from backend import marcas as bmarcas
-from backend.database import DB_PATH
+from backend.database import DB_PATH, init_db
 from backend.models import Empresa, Fornecedor, ItemNota, NotaFiscal
 
 NCM_TESTE = "19059090"
@@ -49,6 +49,10 @@ def _sessao_copia(diretorio):
     copia = Path(diretorio) / "copia_marcas.db"
     shutil.copy(DB_PATH, copia)
     engine = create_engine("sqlite:///" + str(copia).replace("\\", "/"))
+    # A cópia pode ter sido tirada de uma base ainda sem as colunas de uma migração
+    # aditiva (ex.: empresas.omie_app_key). O init_db roda o mesmo ALTER TABLE do
+    # start da API — na cópia, nunca na base real.
+    init_db(engine)
     return sessionmaker(bind=engine)(), engine
 
 
