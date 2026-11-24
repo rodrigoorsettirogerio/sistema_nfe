@@ -267,6 +267,15 @@ SESSAO_LOJA_FONTE_NOTAS = "fonte_notas_loja_selecionada"
 PREFIXO_WIDGET_FONTE_NOTAS = "fonte_notas_loja_"
 CHAVE_VERSAO_FONTE_NOTAS = "_fonte_notas_versao"
 MENSAGEM_FONTE_NOTAS = "_mensagem_fonte_notas"
+# App Secret digitado no painel Omie. A chave do widget leva o id da loja e o
+# envio bem-sucedido marca `LIMPAR_APP_SECRET_OMIE`: o run seguinte apaga o
+# valor da sessão ANTES de recriar o campo (o Streamlit não permite limpar um
+# widget já instanciado no mesmo run). O segredo nunca é pré-preenchido.
+PREFIXO_APP_SECRET_OMIE = "omie_app_secret_"
+LIMPAR_APP_SECRET_OMIE = "_limpar_app_secret_omie"
+# Erro do último envio de credenciais, exibido no run seguinte (o submit sempre
+# dispara `st.rerun` para o campo do segredo voltar vazio).
+ERRO_CREDENCIAIS_OMIE = "_erro_credenciais_omie"
 # Fonte escolhida no formulário "Vincular novo CNPJ" (fora do `st.form`, porque o
 # radio precisa de run para mostrar os campos certos) e o aceite do aviso da SEFAZ.
 NOVA_LOJA_FONTE_NOTAS = "nova_loja_fonte_notas"
@@ -1183,6 +1192,19 @@ def _incrementar_versao_fonte_notas():
     if not isinstance(versao, int):
         versao = 0
     st.session_state[CHAVE_VERSAO_FONTE_NOTAS] = versao + 1
+
+
+def _limpar_app_secret_omie():
+    """Remove da sessão qualquer App Secret digitado no painel Omie.
+
+    Executado no início do run (antes dos widgets) depois de um envio
+    bem-sucedido. Sem isso o valor continuaria no ``session_state`` e o
+    ``type="password"`` do Streamlit permitiria revelá-lo pelo ícone do olho.
+    O App Key não é segredo e permanece.
+    """
+    for chave in list(st.session_state.keys()):
+        if str(chave).startswith(PREFIXO_APP_SECRET_OMIE):
+            st.session_state.pop(chave, None)
 
 
 def salvar_credenciais_omie(cnpj, app_key, app_secret):
@@ -7421,10 +7443,23 @@ def _painel_omie_loja(empresa):
         st.warning(erro_status)
     else:
         _renderizar_resumo_omie(status)
+    erro_credenciais = st.session_state.pop(ERRO_CREDENCIAIS_OMIE, None)
+    if erro_credenciais:
+        st.error(str(erro_credenciais))
 
     st.caption(
         "As credenciais são do aplicativo criado em **app.omie.com.br** e ficam "
         "**cifradas no banco** — o App Secret não é exibido de volta."
+    )
+    # O campo NUNCA recebe `value=`: o segredo gravado não volta do backend, só a
+    # máscara. O placeholder só avisa que já existe um segredo salvo.
+    segredo_configurado = bool(
+        isinstance(status, dict) and status.get("app_secret_configurado")
+    )
+    placeholder_segredo = (
+        "•••••••• (já configurado — digite para trocar)"
+        if segredo_configurado
+        else "App Secret do aplicativo Omie"
     )
     with st.form(key=f"form_credenciais_omie_{empresa_id}"):
         app_key = st.text_input(
@@ -7435,17 +7470,30 @@ def _painel_omie_loja(empresa):
         app_secret = st.text_input(
             "App Secret do Omie",
             type="password",
-            key=f"omie_app_secret_{empresa_id}",
-            help="Segredo do mesmo aplicativo. Gravado cifrado e nunca reexibido.",
+            key=f"{PREFIXO_APP_SECRET_OMIE}{empresa_id}",
+            placeholder=placeholder_segredo,
+            help=(
+                "Segredo do mesmo aplicativo. Gravado cifrado e nunca reexibido; "
+                "o campo sempre nasce vazio."
+            ),
         )
         salvar = st.form_submit_button("💾 Salvar credenciais do Omie")
     if salvar:
-        if not (app_key or "").strip() or not (app_secret or "").strip():
-            st.error("Informe o App Key e o App Secret do Omie para salvar.")
+        chave_texto = str(app_key or "").strip()
+        segredo_texto = str(app_secret or "").strip()
+        # Qualquer submit limpa o segredo no run seguinte (dê certo ou não): o
+        # campo com "olhinho" nunca deve continuar revelável depois do envio.
+        st.session_state[LIMPAR_APP_SECRET_OMIE] = True
+        if not chave_texto or not segredo_texto:
+            st.session_state[ERRO_CREDENCIAIS_OMIE] = (
+                "Informe o App Key e o App Secret do Omie para salvar."
+            )
+            st.rerun()
         else:
-            dados, erro = salvar_credenciais_omie(cnpj, app_key, app_secret)
+            dados, erro = salvar_credenciais_omie(cnpj, chave_texto, segredo_texto)
             if erro:
-                st.error(erro)
+                st.session_state[ERRO_CREDENCIAIS_OMIE] = erro
+                st.rerun()
             else:
                 st.session_state[MENSAGEM_FONTE_NOTAS] = (
                     dados.get("mensagem")
@@ -7606,6 +7654,9 @@ def renderizar_minhas_lojas(empresas, erro_api=None):
     # CNPJ, arquivo, senha e confirmações vazios/desmarcados.
     if st.session_state.pop(LIMPAR_FORM_MINHAS_LOJAS, False):
         _limpar_formulario_minhas_lojas()
+    if st.session_state.pop(LIMPAR_APP_SECRET_OMIE, False):
+        # Segredo do Omie já enviado: some da sessão antes do campo ser recriado.
+        _limpar_app_secret_omie()
     if st.session_state.pop(LIMPAR_CONFIRMACAO_EXCLUSAO_CERT, False):
         _limpar_confirmacoes_exclusao_certificado()
 
