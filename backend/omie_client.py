@@ -56,6 +56,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -128,6 +129,54 @@ class OmieNaoConfigurado(ErroOmie):
                 "OMIE_APP_SECRET no .env e execute novamente."
             )
         )
+
+
+class OmieSemRegistros(ErroOmie):
+    """A Omie respondeu HTTP 500 "Não existem registros para a página".
+
+    A API não devolve lista vazia quando a etapa/período não tem notas: o
+    gateway responde erro 500 com essa mensagem. Para a sincronização isso
+    significa "nenhum dado naquele recorte" — não é falha de credencial, de
+    rede nem de contrato, então as listagens traduzem a exceção em ``[]`` e o
+    agendador não marca a loja como com erro.
+    """
+
+
+def _sem_acento(texto: Any) -> str:
+    """Texto em minúsculas e sem acentos, para comparar mensagens do Omie.
+
+    A mensagem pode chegar como ``"Não existem registros"`` ou
+    ``"Nao existem registros"`` (gateway/SO diferentes); normalizar evita que
+    o 500 de "sem dados" seja tratado como erro fatal em um dos formatos.
+    """
+    decomposto = unicodedata.normalize("NFKD", str(texto or ""))
+    return "".join(
+        caractere for caractere in decomposto if not unicodedata.combining(caractere)
+    ).lower()
+
+
+def _pagina_sem_registros(status: Any, corpo: Any) -> bool:
+    """True quando o erro HTTP é o 500 de "página sem registros" do Omie."""
+    if _inteiro(status) != 500:
+        return False
+    return "nao existem registros" in _sem_acento(_detalhe_erro(corpo))
+
+
+def sem_registros(erro: Any) -> bool:
+    """True quando a exceção representa apenas "não há dados" no Omie.
+
+    A checagem olha o status 500 **e** a mensagem, porque a Omie usa 500 para
+    outros problemas também. É usada pelo agendador (uma loja sem notas no
+    período não pode virar erro no log) e fica exposta para os scripts de
+    diagnóstico usarem o mesmo critério.
+    """
+    if not isinstance(erro, ErroOmie):
+        return False
+    if _inteiro(getattr(erro, "status", None)) != 500:
+        return False
+    if isinstance(erro, OmieSemRegistros):
+        return True
+    return "nao existem registros" in _sem_acento(str(erro))
 
 
 def _valor_ambiente(nome: str, padrao: str = "") -> str:
@@ -469,6 +518,8 @@ class OmieClient:
         corpo = _json_ou_texto(resposta)
 
         # Nível 1: erro HTTP (proxy, URL errada, indisponibilidade do Omie).
+        # O 500 "Não existem registros para a página" é o jeito do Omie de dizer
+        # "sem dados" — tem classe própria para as listagens devolverem [].
         if not resposta.ok:
             detalhe = _detalhe_erro(corpo)
             mensagem = (
@@ -476,6 +527,10 @@ class OmieClient:
             )
             if detalhe:
                 mensagem += f": {detalhe}"
+            if _pagina_sem_registros(resposta.status_code, corpo):
+                raise OmieSemRegistros(
+                    mensagem, status=resposta.status_code, corpo=corpo
+                )
             raise ErroOmie(
                 mensagem, status=resposta.status_code, corpo=corpo
             )
@@ -572,9 +627,13 @@ class OmieClient:
         """
         inicio, fim = _periodo_opcional(data_inicio, data_fim)
         pagina, por_pagina = _paginacao(pagina, registros_por_pagina)
-        resposta = self._pagina_recebimentos(
-            inicio, fim, pagina, por_pagina, etapa
-        )
+        try:
+            resposta = self._pagina_recebimentos(
+                inicio, fim, pagina, por_pagina, etapa
+            )
+        except OmieSemRegistros:
+            # Etapa/período sem notas: a Omie responde 500 em vez de lista vazia.
+            return []
         return _lista_de(resposta, "recebimentos", "ListarRecebimentos")
 
     def listar_todos_recebimentos(
@@ -606,9 +665,14 @@ class OmieClient:
 
         recebimentos: List[Dict[str, Any]] = []
         for pagina in range(1, limite + 1):
-            resposta = self._pagina_recebimentos(
-                inicio, fim, pagina, por_pagina, etapa
-            )
+            try:
+                resposta = self._pagina_recebimentos(
+                    inicio, fim, pagina, por_pagina, etapa
+                )
+            except OmieSemRegistros:
+                # Página 1 sem registros = etapa vazia no período; o que já foi
+                # lido (se for uma página seguinte) continua válido.
+                return recebimentos
             lote = _lista_de(resposta, "recebimentos", "ListarRecebimentos")
             recebimentos.extend(lote)
 
@@ -678,7 +742,11 @@ class OmieClient:
         """
         inicio, fim = _periodo(data_inicio, data_fim)
         pagina, por_pagina = _paginacao(pagina, registros_por_pagina)
-        resposta = self._pagina_documentos(inicio, fim, pagina, por_pagina)
+        try:
+            resposta = self._pagina_documentos(inicio, fim, pagina, por_pagina)
+        except OmieSemRegistros:
+            # Nenhum documento de entrada no período (500 "sem registros").
+            return []
         return _lista_de(
             resposta, "documentosEncontrados", "ListarDocumentos"
         )
@@ -704,7 +772,10 @@ class OmieClient:
 
         documentos: List[Dict[str, Any]] = []
         for pagina in range(1, limite + 1):
-            resposta = self._pagina_documentos(inicio, fim, pagina, por_pagina)
+            try:
+                resposta = self._pagina_documentos(inicio, fim, pagina, por_pagina)
+            except OmieSemRegistros:
+                return documentos
             lote = _lista_de(
                 resposta, "documentosEncontrados", "ListarDocumentos"
             )

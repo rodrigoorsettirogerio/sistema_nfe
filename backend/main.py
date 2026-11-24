@@ -1,4 +1,5 @@
 import hashlib
+import json
 import logging
 import os
 import re
@@ -35,6 +36,11 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 from backend.database import PROJECT_ROOT, SessionLocal, get_db, init_db
 from backend import acbr_client, auth, certificados
+# Credenciais Omie da loja: cifradas no banco (Fernet) e nunca devolvidas inteiras.
+from backend import cripto_credenciais
+# Sincronização dos recebimentos do Omie -> fornecedores/notas/itens (fase 2).
+from backend import omie_sync
+from backend.omie_client import ErroOmie, OmieNaoConfigurado
 from backend.email_service import (
     detalhe_erro_smtp,
     recarregar_configuracao_smtp,
@@ -86,8 +92,11 @@ from backend import agendador
 
 @asynccontextmanager
 async def _ciclo_de_vida(_app):
-    """Liga o agendador com a API e o desliga no shutdown (sem cron externo)."""
+    """Liga os agendadores com a API e os desliga no shutdown (sem cron externo)."""
     agendador.iniciar(_executar_agendamento)
+    # Sincronização Omie diária: cada loja com credencial gravada, com pausa
+    # entre lojas (HTTP 425 da API do Omie em rajadas).
+    agendador.iniciar_omie(_executar_sincronizacao_omie_agendada)
     try:
         yield
     finally:
@@ -2658,6 +2667,397 @@ def _baixar_e_importar_acbr_em_background(cnpj: str, ambiente: str = "") -> dict
         )
     finally:
         db.close()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Integração Omie (fase 3a): credenciais da loja, sincronização e status
+# ──────────────────────────────────────────────────────────────────────────────
+# O resumo da última sincronização fica no banco (configuracoes_sistema, chave
+# "omie_ultima_sync:<cnpj>") e não só na memória: o status continua correto
+# depois de reiniciar a API. Só contadores/período/etapas/erros entram nele —
+# nenhuma credencial é copiada para cá (o app_secret existe apenas cifrado em
+# empresas e nunca sai em resposta HTTP).
+CHAVE_RESUMO_OMIE = "omie_ultima_sync"
+# Contadores devolvidos pela rota de status (mesmos nomes do omie_sync).
+CAMPOS_CONTAGEM_OMIE = (
+    "recebimentos",
+    "novas",
+    "duplicadas",
+    "canceladas",
+    "ignoradas",
+    "itens",
+    "bonificados",
+    "notas_sem_itens",
+    "fornecedores_novos",
+    "fornecedores_atualizados",
+    "mapeamentos_criados",
+    "mapeamentos_usados",
+)
+# O resumo é um estado para a tela, não um log: limita erros e amostra.
+LIMITE_ERROS_RESUMO_OMIE = 20
+LIMITE_NOTAS_RESUMO_OMIE = 5
+
+
+class CredenciaisOmieRequest(BaseModel):
+    """Corpo de POST /api/omie/credenciais (app_key/app_secret da loja)."""
+
+    cnpj: str
+    app_key: str = ""
+    app_secret: str = ""
+
+
+class SincronizacaoOmieRequest(BaseModel):
+    """Corpo de POST /api/omie/sincronizar.
+
+    ``dias`` é a janela para trás quando não há datas (``null`` = histórico
+    inteiro, usado na primeira importação). Datas ``data_inicio``/``data_fim``
+    têm prioridade e precisam vir as duas. ``etapas`` aceita 40/60/80; vazio
+    usa o padrão do sincronizador (Faturado + Recebido + Conferido).
+    ``simular`` roda a importação e desfaz tudo no fim (``--simular`` da tela).
+    """
+
+    cnpj: str
+    dias: Optional[int] = Field(omie_sync.DIAS_PADRAO, ge=1, le=3650)
+    data_inicio: Optional[date] = None
+    data_fim: Optional[date] = None
+    etapas: Optional[List[str]] = None
+    simular: bool = False
+
+
+def _cnpj_digitos(valor) -> str:
+    """CNPJ só com dígitos (mesma normalização das rotas da ACBr)."""
+    return re.sub(r"\D", "", str(valor or ""))
+
+
+def _loja_para_omie(db: Session, cnpj, usuario: Usuario) -> Empresa:
+    """Loja do CNPJ com a checagem de dono usada por todas as rotas do Omie.
+
+    Levanta 400 (CNPJ inválido), 404 (loja inexistente) ou 403 (loja de outra
+    conta) — a mesma regra de `_pode_gerenciar_loja` das rotas ACBr: o admin
+    gerencia todas, a conta comum só as próprias.
+    """
+    cnpj_limpo = _cnpj_digitos(cnpj)
+    if len(cnpj_limpo) != 14:
+        raise HTTPException(status_code=400, detail="Informe um CNPJ com 14 dígitos.")
+    empresa = db.query(Empresa).filter(Empresa.cnpj == cnpj_limpo).first()
+    if empresa is None:
+        raise HTTPException(status_code=404, detail="CNPJ não encontrado.")
+    if not _pode_gerenciar_loja(usuario, empresa):
+        raise HTTPException(
+            status_code=403, detail="Esta loja não pertence à sua conta."
+        )
+    return empresa
+
+
+def _situacao_credenciais_omie(empresa: Empresa) -> dict:
+    """Credenciais Omie da loja SEM devolver o segredo (só máscara/indicadores).
+
+    A credencial da loja tem prioridade; sem ela vale o par do ``.env`` (modo
+    de uma loja só/scripts), como em ``omie_sync.credenciais_da_empresa``.
+    Quando o token gravado não abre com a chave atual (``ErroCredenciais``), o
+    status continua respondendo: devolve ``erro`` e ``loja_configurada=False``
+    para a tela pedir a re-gravação.
+    """
+    erro = None
+    try:
+        app_key = cripto_credenciais.descriptografar(
+            getattr(empresa, "omie_app_key", "") or ""
+        )
+        app_secret = cripto_credenciais.descriptografar(
+            getattr(empresa, "omie_app_secret", "") or ""
+        )
+    except cripto_credenciais.ErroCredenciais as exc:
+        app_key, app_secret, erro = "", "", str(exc)
+
+    ambiente = bool(
+        (os.getenv("OMIE_APP_KEY") or "").strip()
+        and (os.getenv("OMIE_APP_SECRET") or "").strip()
+    )
+    loja_configurada = bool(app_key and app_secret)
+    if loja_configurada:
+        origem = "empresa"
+    elif ambiente:
+        origem = "ambiente"
+    else:
+        origem = None
+    return {
+        "configurado": loja_configurada or ambiente,
+        "loja_configurada": loja_configurada,
+        "ambiente_configurado": ambiente,
+        "origem": origem,
+        # Chave mascarada (4 últimos) e apenas o indicador do segredo: nem a
+        # tela nem o suporte precisam do valor real para conferir a credencial.
+        "app_key": cripto_credenciais.mascarar_segredo(app_key),
+        "app_secret_configurado": bool(app_secret),
+        "erro": erro,
+    }
+
+
+def _ultima_sincronizacao_omie(db: Session, cnpj) -> Optional[dict]:
+    """Resumo da última sincronização real da loja (None quando nunca rodou)."""
+    bruto = _valor_configuracao_sistema(
+        db, f"{CHAVE_RESUMO_OMIE}:{_cnpj_digitos(cnpj)}"
+    )
+    if not bruto:
+        return None
+    try:
+        dados = json.loads(bruto)
+    except (TypeError, ValueError):
+        logger.warning("Omie: resumo de sincronização ilegível para %s.", cnpj)
+        return None
+    return dados if isinstance(dados, dict) else None
+
+
+def _registrar_sincronizacao_omie(db: Session, cnpj, resumo: dict) -> dict:
+    """Grava (e devolve) o resumo da última sincronização da loja.
+
+    Guarda só o que a tela precisa: contadores, período, totais por etapa,
+    erros limitados e a amostra de notas novas. ``origem_credenciais`` diz se
+    veio da loja ou do ``.env`` — nenhum app_key/app_secret entra no registro.
+    """
+    resumo = resumo if isinstance(resumo, dict) else {}
+    registro = {
+        "executado_em": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "periodo": resumo.get("periodo"),
+        "etapas": resumo.get("etapas") or {},
+        "contagens": {
+            campo: resumo.get(campo, 0) for campo in CAMPOS_CONTAGEM_OMIE
+        },
+        "erros": [
+            str(erro)[:300] for erro in (resumo.get("erros") or [])
+        ][:LIMITE_ERROS_RESUMO_OMIE],
+        "notas_novas": (resumo.get("notas_novas") or [])[:LIMITE_NOTAS_RESUMO_OMIE],
+        "origem_credenciais": resumo.get("origem_credenciais"),
+        "simulado": bool(resumo.get("simulado")),
+        "sincronizado_em": resumo.get("sincronizado_em"),
+    }
+    chave = f"{CHAVE_RESUMO_OMIE}:{_cnpj_digitos(cnpj)}"
+    linha = (
+        db.query(ConfiguracaoSistema)
+        .filter(ConfiguracaoSistema.chave == chave)
+        .first()
+    )
+    if linha is None:
+        linha = ConfiguracaoSistema(chave=chave)
+        db.add(linha)
+    linha.valor = json.dumps(registro, ensure_ascii=False)
+    linha.atualizado_em = registro["executado_em"]
+    linha.atualizado_por = None
+    db.commit()
+    return registro
+
+
+def _sincronizar_loja_omie(db: Session, empresa: Empresa, **parametros) -> dict:
+    """Sincroniza UMA loja e registra o resumo quando houve gravação real.
+
+    Centraliza a chamada da rota manual e do agendador: as duas usam a mesma
+    regra de credencial (loja -> ``.env``) e o mesmo formato de resumo. Em
+    ``simular`` nada foi gravado, então o resumo anterior e o ``omie_sync_em``
+    não são alterados.
+    """
+    resumo = omie_sync.sincronizar_recebimentos(db, empresa, **parametros)
+    if not resumo.get("simulado"):
+        _registrar_sincronizacao_omie(db, getattr(empresa, "cnpj", ""), resumo)
+    return resumo
+
+
+@app.post("/api/omie/credenciais")
+def salvar_credenciais_omie(
+    dados: CredenciaisOmieRequest,
+    usuario: Usuario = Depends(auth.usuario_atual),
+    db: Session = Depends(get_db),
+):
+    """Grava o App Key/App Secret do Omie da loja, CIFRADOS no banco.
+
+    O segredo é uma credencial de API (consulta/lança notas em nome da loja) e
+    não volta inteiro: a resposta traz só os 4 últimos caracteres, para a tela
+    confirmar o que foi salvo. A loja precisa ser da conta logada (admin vê
+    todas). Erro de criptografia (chave do Fernet ausente/trocada) é 500 com a
+    instrução de correção — não é problema de payload do cliente.
+    """
+    empresa = _loja_para_omie(db, dados.cnpj, usuario)
+    app_key = str(dados.app_key or "").strip()
+    app_secret = str(dados.app_secret or "").strip()
+    if not app_key or not app_secret:
+        raise HTTPException(
+            status_code=400,
+            detail="Informe o App Key e o App Secret do Omie para gravar a credencial.",
+        )
+    try:
+        omie_sync.definir_credenciais(db, empresa, app_key, app_secret)
+    except omie_sync.ErroSincronizacao as erro:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(erro)) from erro
+    except cripto_credenciais.ErroCredenciais as erro:
+        db.rollback()
+        logger.error(
+            "Omie: não foi possível cifrar a credencial da loja %s: %s",
+            empresa.cnpj,
+            erro,
+        )
+        raise HTTPException(status_code=500, detail=str(erro)) from erro
+
+    logger.info(
+        "Omie: credenciais da loja %s gravadas pelo usuário %s (app_key %s).",
+        empresa.cnpj,
+        usuario.email,
+        cripto_credenciais.mascarar_segredo(app_key),
+    )
+    return {
+        "sucesso": True,
+        "cnpj": empresa.cnpj,
+        "loja": empresa.nome_loja or empresa.razao_social,
+        "configurado": True,
+        "app_key": cripto_credenciais.mascarar_segredo(app_key),
+        "app_secret": cripto_credenciais.mascarar_segredo(app_secret),
+        "mensagem": (
+            "Credenciais do Omie gravadas (cifradas no banco). "
+            "O segredo não é exibido de volta."
+        ),
+    }
+
+
+@app.post("/api/omie/sincronizar")
+def sincronizar_omie(
+    dados: SincronizacaoOmieRequest,
+    usuario: Usuario = Depends(auth.usuario_atual),
+    db: Session = Depends(get_db),
+):
+    """Dispara a sincronização dos recebimentos do Omie para a loja.
+
+    Usa a credencial gravada na loja e, se ela ainda não existir, o par
+    ``OMIE_APP_KEY``/``OMIE_APP_SECRET`` do ``.env`` (mesma regra do script
+    ``testar_omie_sync.py``). O retorno é o resumo completo da execução
+    (``novas``/``duplicadas``/``itens``/``erros``/``etapas``...) mais o recorte
+    de contadores que a tela usa. ``simular=True`` roda tudo e desfaz no fim:
+    nada é gravado e o ``omie_sync_em``/resumo anterior não mudam.
+
+    Erros são traduzidos para o cliente: credencial ausente/ilegível e período
+    inválido = 400; recusa da API do Omie = 502 (o problema é do fornecedor,
+    não da requisição). O detalhe do 502 nunca inclui app_key/app_secret.
+    """
+    empresa = _loja_para_omie(db, dados.cnpj, usuario)
+    if (dados.data_inicio is None) != (dados.data_fim is None):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Informe as duas datas (início e fim) ou nenhuma — sem datas a "
+                "sincronização usa a janela de dias."
+            ),
+        )
+
+    parametros = {
+        "dias": dados.dias,
+        "confirmar": not dados.simular,
+    }
+    if dados.data_inicio is not None and dados.data_fim is not None:
+        parametros["data_inicio"] = dados.data_inicio
+        parametros["data_fim"] = dados.data_fim
+        parametros["dias"] = None  # as datas mandam; a janela não é usada
+    if dados.etapas:
+        parametros["etapas"] = dados.etapas
+
+    try:
+        resumo = _sincronizar_loja_omie(db, empresa, **parametros)
+    except OmieNaoConfigurado as erro:
+        db.rollback()
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"{erro} Grave o App Key/App Secret na loja "
+                "(POST /api/omie/credenciais) ou configure o .env."
+            ),
+        ) from erro
+    except cripto_credenciais.ErroCredenciais as erro:
+        db.rollback()
+        logger.error(
+            "Omie: credencial ilegível na sincronização da loja %s: %s",
+            empresa.cnpj,
+            erro,
+        )
+        raise HTTPException(status_code=400, detail=str(erro)) from erro
+    except omie_sync.ErroSincronizacao as erro:
+        db.rollback()
+        raise HTTPException(status_code=400, detail=str(erro)) from erro
+    except ErroOmie as erro:
+        db.rollback()
+        logger.error(
+            "Omie: falha na sincronização da loja %s (HTTP %s): %s",
+            empresa.cnpj,
+            erro.status,
+            erro,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"API do Omie recusou a sincronização: {erro}",
+        ) from erro
+
+    logger.info(
+        "Omie: sincronização da loja %s por %s (simulado=%s): %s novas, "
+        "%s duplicadas, %s itens.",
+        empresa.cnpj,
+        usuario.email,
+        bool(resumo.get("simulado")),
+        resumo.get("novas"),
+        resumo.get("duplicadas"),
+        resumo.get("itens"),
+    )
+    return {
+        "sucesso": True,
+        "cnpj": empresa.cnpj,
+        "loja": resumo.get("empresa") or empresa.nome_loja,
+        "simulado": bool(resumo.get("simulado")),
+        "contagens": {
+            campo: resumo.get(campo, 0) for campo in CAMPOS_CONTAGEM_OMIE
+        },
+        "resumo": resumo,
+        "ultima_sincronizacao": _ultima_sincronizacao_omie(db, empresa.cnpj),
+    }
+
+
+@app.get("/api/omie/status/{cnpj}")
+def status_omie(
+    cnpj: str,
+    usuario: Usuario = Depends(auth.usuario_atual),
+    db: Session = Depends(get_db),
+):
+    """Situação da integração Omie da loja — sem expor o app_secret.
+
+    Devolve ``omie_sync_em``, as contagens da última sincronização real
+    (guardadas em ``configuracoes_sistema``) e se a loja/ambiente tem
+    credencial. A tela usa isso para mostrar "última sync" e o botão de
+    sincronizar. Credencial ilegível (chave do Fernet trocada) não derruba o
+    status: vem em ``erro_credenciais`` para o cliente regravar.
+    """
+    empresa = _loja_para_omie(db, cnpj, usuario)
+    situacao = _situacao_credenciais_omie(empresa)
+    ultima = _ultima_sincronizacao_omie(db, empresa.cnpj)
+    return {
+        "cnpj": empresa.cnpj,
+        "loja": empresa.nome_loja or empresa.razao_social,
+        "omie_sync_em": empresa.omie_sync_em,
+        "configurado": situacao["configurado"],
+        "loja_configurada": situacao["loja_configurada"],
+        "ambiente_configurado": situacao["ambiente_configurado"],
+        "origem_credenciais": situacao["origem"],
+        "app_key": situacao["app_key"],
+        "app_secret_configurado": situacao["app_secret_configurado"],
+        "erro_credenciais": situacao["erro"],
+        "ultima_sincronizacao": ultima,
+        "contagens": (ultima or {}).get("contagens"),
+        "consultado_em": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def _executar_sincronizacao_omie_agendada(db: Session, empresa: Empresa) -> dict:
+    """Callback do agendador: a MESMA sincronização da rota, no recorte padrão.
+
+    O agendador só escolhe a loja e a hora (backend/agendador.py); aqui roda a
+    janela padrão (``omie_sync.DIAS_PADRAO`` dias, etapas 40/60/80) e grava o
+    resumo que ``GET /api/omie/status/{cnpj}`` devolve. Exceções sobem para o
+    agendador, que decide entre "sem dados" (HTTP 500 do Omie) e falha real.
+    """
+    return _sincronizar_loja_omie(db, empresa, dias=omie_sync.DIAS_PADRAO)
 
 
 # Motor de alertas (WhatsApp/e-mail): configuração do cliente + simulador da mensagem

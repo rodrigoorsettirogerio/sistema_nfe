@@ -51,7 +51,7 @@ Dependências principais (`requirements.txt`):
 Presentes hoje: `DEEPSEEK_API_KEY`, `ACBR_CLIENT_ID`, `ACBR_CLIENT_SECRET`, `ACBR_AMBIENTE`, `ACBR_AUTH_URL`, `ACBR_API_URL`, `ACBR_SCOPES`, `DIAS_PRIMEIRO_DOWNLOAD`.
 Opcionais previstas no código: `ACBR_TIMEOUT`, `DEEPSEEK_MODEL`, `DEEPSEEK_API_URL`, `DEEPSEEK_TIMEOUT`, `NFE_SECRET_KEY`, `NFE_TOKEN_HORAS`, `NFE_2FA_HORAS`.
 Alertas/consultas: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `SMTP_FROM_NAME`, `SMTP_TIMEOUT`, `NFE_SMTP_DESATIVADO` (teste), `NFE_ALERTAS_AGENDADOR` (`0` desliga a thread), `NFE_ALERTAS_HORA` (0-23, padrão 6), `NFE_ESPERA_ENTRE_PROVEDORES` (pausa ao trocar de provedor do CNPJ, padrão 1 s), `NFE_CACHE_CADASTRAL_HORAS` (TTL do cache de CNPJ/CEP, padrão 720 h).
-Omie: `OMIE_APP_KEY`/`OMIE_APP_SECRET` (credencial de fallback quando a loja não tem a sua; `testar_omie_sync.py --gravar-credenciais` grava a da loja cifrada), `OMIE_ENC_KEY` (chave do Fernet; sem ela o módulo usa `NFE_SECRET_KEY` ou o `.secret_key`), `OMIE_TIMEOUT` (segundos por chamada, padrão 60).
+Omie: `OMIE_APP_KEY`/`OMIE_APP_SECRET` (credencial de fallback quando a loja não tem a sua; `testar_omie_sync.py --gravar-credenciais` grava a da loja cifrada), `OMIE_ENC_KEY` (chave do Fernet; sem ela o módulo usa `NFE_SECRET_KEY` ou o `.secret_key`), `OMIE_TIMEOUT` (segundos por chamada, padrão 60). Agendamento Omie: `NFE_OMIE_AGENDADOR` (`0` desliga a thread diária), `NFE_OMIE_HORA` (0-23, padrão 3) e `NFE_OMIE_PAUSA_SEGUNDOS` (espera entre lojas, padrão 2 s).
 
 `.gitignore` protege `.env`, `.secret_key`, `__pycache__/`, `*.py[cod]` e `*.log`. **Ainda não existe repositório Git inicializado** (`git status` retorna “SEM_GIT”).
 
@@ -101,6 +101,7 @@ sistema_nfe_pro/
 │   ├── test_marcas.py                  # script de validação da inteligência de marcas
 │   ├── test_marcas_master.py           # 7 testes do catálogo mestre/cache
 │   ├── test_omie_sync.py               # sincronização Omie offline (cliente falso, SQLite temporário)
+│   ├── test_omie_rotas.py              # rotas /api/omie/* + agendador diário (12 testes, mock)
 │   └── _verificar_auditoria_tmp.py     # inspeção temporária da tela de Auditoria
 ├── xmls/                        # XMLs locais de NF-e (grande volume, dados de operação)
 ├── import_xmls.py               # importador principal dos XMLs
@@ -337,7 +338,14 @@ python testar_omie_sync.py --tudo --etapas 40,60,80 --sem-marcas
 
 `--cnpj` escolhe a loja (sem ele, só roda se houver **uma** loja cadastrada; com várias, lista as opções e falha), `--data-inicio`/`--data-fim` (dd/mm/aaaa) substituem `--dias` e `--tudo` importa o histórico inteiro. Códigos de saída: `0` sucesso, `1` falha de configuração/credencial/loja, `2` concluiu com erros por nota/etapa (nestes casos `--simular` também sai com `2` e avisa que a simulação teve erros).
 
-**Ainda não existe** rota de API nem tela para o Omie (fase 3): hoje a credencial é gravada e a sincronização é disparada pelos scripts acima.
+**Fase 3a — API e agendamento (24/11/2026).** O Omie agora é operado pela API, não só por script:
+
+- `POST /api/omie/credenciais` grava `app_key`/`app_secret` da loja **cifrados** (`fernet:v1:`) e devolve apenas a máscara com os 4 últimos caracteres — o segredo não volta;
+- `POST /api/omie/sincronizar` roda a fase 2 com a credencial da loja (ou o `.env` como fallback) e devolve o resumo (novas/duplicadas/itens/erros/etapas). Aceita `dias` (padrão 30; `null` = histórico), `data_inicio`/`data_fim` (as duas juntas), `etapas` (40/60/80) e `simular` (rollback, nada gravado);
+- `GET /api/omie/status/{cnpj}` devolve `omie_sync_em`, as contagens da última sincronização real (resumo persistido em `configuracoes_sistema`, chave `omie_ultima_sync:<cnpj>`), se há credencial (loja/ambiente) e a chave mascarada — **nunca** o `app_secret`;
+- o agendador (`backend/agendador.py`) roda **diariamente** na hora `NFE_OMIE_HORA` (padrão 3), uma vez por loja com credencial gravada, com pausa entre lojas (`NFE_OMIE_PAUSA_SEGUNDOS`, padrão 2 s, por causa do HTTP 425). A loja já sincronizada no dia é pulada (`omie_sync_em` convertido para o fuso local) e a falha não repete a cada minuto. O HTTP 500 `ERROR: Não existem registros para a página [1]!` é tratado como **sem dados** (`OmieSemRegistros` → lista vazia), não como erro fatal.
+
+As três rotas usam a mesma checagem de dono das rotas ACBr (`_pode_gerenciar_loja`: admin vê todas). Erros: credencial ausente/ilegível e período inválido = 400; recusa da API do Omie = 502. A tela em **Minhas Lojas** é a parte 2 (ainda pendente). O XML da nota só aparece no Omie depois que ela chega em **Recebido** (`cEtapa` 60); etapas 40 trazem apenas cabeçalho + `itensRecebimento`, e o `cXml` chega HTML-escapado (`html.unescape` antes de usar).
 
 ---
 
@@ -403,6 +411,9 @@ python tests/test_verificacao_email.py
 # Sincronização Omie sem rede (cliente falso + SQLite temporário)
 python tests/test_omie_sync.py
 
+# Rotas /api/omie/* e agendador diário (mock, SQLite temporário)
+python tests/test_omie_rotas.py
+
 # Migração SQLite -> PostgreSQL (destino temporário; só lê a base real)
 python tests/test_migracao_postgres.py
 ```
@@ -411,6 +422,7 @@ python tests/test_migracao_postgres.py
 
 - `python -m py_compile` de todos os módulos (backend, front, testes): **OK**.
 - `tests/test_omie_sync.py`: **OK** — migração aditiva idempotente das colunas Omie, credenciais Fernet (cifra, lê de volta, origem loja/ambiente, erro de chave trocada), sincronização real contra `ClienteFalso` (mapeamento de chave/número/série/data/valor/fornecedor/EAN/NCM/CFOP, valores crus vs `*_base`, bonificação ignorada, cancelada não gravada, dedupe na segunda execução, `--simular` = rollback), tudo em SQLite temporário e sem rede.
+- `tests/test_omie_rotas.py`: **12/12** — credencial cifrada + máscara (sem segredo na resposta), 403/400/404, status com `omie_sync_em`/contagens e credencial ilegível, sincronização com janela padrão/datas/etapas/simulação e tradução de erros (400/502), agendamento diário (uma vez por loja, pausa, não repete no dia) e HTTP 500 "Não existem registros" = sem dados. `py_compile` de `backend/main.py`, `backend/agendador.py`, `backend/omie_client.py` e do teste: **OK**; `tests/test_acbr_rotas.py` continua passando (app sobe com os dois agendadores).
 - `tests/test_migracao_postgres.py`: **passou** (cópia com as colunas novas, IDs/contagens preservados).
 - `tests/test_multitenancy_lojas.py`: **9/9** (inclui as colunas novas de `empresas`).
 - `tests/test_marcas.py` e `tests/test_integridade_relatorios.py` agora chamam `init_db(engine)` na **cópia** do banco, então a cópia nasce com as migrações aditivas (antes a suíte quebrava em `no such column: empresas.omie_app_key`); a base real continua intocada. A suíte principal continua exigindo a API ligada.
@@ -451,6 +463,16 @@ Arquivos alterados nesta frente: `backend/consulta_cadastral.py` (novo), `backen
 5. **Testes**: `tests/test_omie_sync.py` (offline, cliente falso) e `init_db(engine)` na cópia usada por `test_marcas.py`/`test_integridade_relatorios.py`.
 
 Arquivos novos/alterados nesta frente: `backend/omie_client.py`, `backend/omie_sync.py`, `backend/cripto_credenciais.py`, `backend/models.py`, `backend/database.py`, `testar_omie.py`, `testar_omie_sync.py`, `tests/test_omie_sync.py`, `tests/test_marcas.py`, `tests/test_integridade_relatorios.py` e este resumo.
+
+### Frente Omie — fase 3a: rotas e agendador (24/11/2026)
+
+1. **Rotas** (`backend/main.py`): `POST /api/omie/credenciais` (grava cifrado e devolve só a máscara), `POST /api/omie/sincronizar` (janela/datas/etapas/`simular`, resumo completo) e `GET /api/omie/status/{cnpj}` (`omie_sync_em`, contagens da última execução, origem da credencial, sem segredo). Todas passam por `_loja_para_omie`/`_pode_gerenciar_loja`.
+2. **Resumo persistido**: `_registrar_sincronizacao_omie` grava contadores/período/etapas/erros em `configuracoes_sistema` (`omie_ultima_sync:<cnpj>`); simulação não atualiza o resumo nem `omie_sync_em`.
+3. **Agendador** (`backend/agendador.py`): segundo laço diário (`iniciar_omie`) na hora `NFE_OMIE_HORA` (padrão 3), só lojas com credencial, pausa `NFE_OMIE_PAUSA_SEGUNDOS` (padrão 2 s) entre lojas, marcação por dia (local) e `tentativas` em memória; `parar()` encerra os dois laços.
+4. **HTTP 500 "Não existem registros"** (`backend/omie_client.py`): nova `OmieSemRegistros` + `sem_registros()`; `_chamar` classifica o erro e as quatro listagens (`recebimentos`/`documentos`, página e todas) devolvem `[]` em vez de exceção.
+5. **Testes**: `tests/test_omie_rotas.py` (12 testes, mock e SQLite temporário) cobrindo rotas, permissões, status sem segredo, agendador e classificação do 500.
+
+Arquivos novos/alterados nesta frente: `backend/main.py`, `backend/agendador.py`, `backend/omie_client.py`, `tests/test_omie_rotas.py` e este resumo. A tela em Minhas Lojas (parte 2) fica pendente.
 
 ---
 
@@ -531,9 +553,9 @@ Arquivos novos/alterados nesta frente: `backend/omie_client.py`, `backend/omie_s
 
 ### Sprint 1.5 — Omie fase 3 (rotas + tela)
 
-- [ ] `POST /api/omie/credenciais` (grava cifrado, devolve só os 4 últimos caracteres), `POST /api/omie/sincronizar` (dispara o sync da loja e devolve o resumo) e `GET /api/omie/status/{cnpj}` (`omie_sync_em`, origem da credencial, última execução).
+- [x] `POST /api/omie/credenciais` (grava cifrado, devolve só os 4 últimos caracteres), `POST /api/omie/sincronizar` (dispara o sync da loja e devolve o resumo) e `GET /api/omie/status/{cnpj}` (`omie_sync_em`, origem da credencial, última execução).
 - [ ] Tela em **Minhas Lojas**: campos de `app_key`/`app_secret`, botão **🔄 Sincronizar Omie** com resumo (novas/duplicadas/itens/erros) e teste em `--simular` antes de gravar.
-- [ ] Definir agendamento (mesma lógica do NSU da ACBr) e recorte padrão (dias/etapas) por loja.
+- [x] Definir agendamento (mesma lógica do NSU da ACBr) e recorte padrão (dias/etapas) por loja — diário às `NFE_OMIE_HORA` (padrão 3), 30 dias/etapas 40/60/80, pausa entre lojas.
 
 ### Sprint 2 — alertas reais
 
@@ -603,7 +625,7 @@ Com a API em `:8000` e o Streamlit rodando:
 - As rotas de relatório não têm isolamento por conta no backend (item P0).
 - A suíte principal usa o banco real e a API no ar; alguns testes são sensíveis ao estado dos dados.
 - O front fala com um único endereço local fixo.
-- A integração Omie (fases 1 e 2) só existe por script: não há rota, tela nem agendador — e o recorte de etapas/período é definido na linha de comando.
+- A integração Omie tem API e agendador (fase 3a), mas ainda **não tem tela**: a credencial pode ser gravada por `POST /api/omie/credenciais` ou pelo script, e o recorte padrão do agendador é 30 dias/etapas 40/60/80 (a rota aceita outros recortes).
 - Não há Git, CI, container, HTTPS ou migrações versionadas.
 
 ---
