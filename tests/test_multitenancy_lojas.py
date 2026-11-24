@@ -132,6 +132,15 @@ def test_consultar_cnpj_de_outra_conta_nao_expoe_dados() -> None:
     assert chamadas == [], chamadas
 
 
+def _erro_http(funcao, **kwargs):
+    """Chama a rota esperando HTTPException; devolve (status, detalhe)."""
+    try:
+        funcao(**kwargs)
+    except HTTPException as erro:
+        return erro.status_code, str(erro.detail)
+    raise AssertionError(f"{funcao.__name__} deveria ter levantado HTTPException.")
+
+
 def _criar_admin(db) -> Usuario:
     """Conta de suporte (`is_admin=True`): a visão de todas as lojas do rodrigo."""
     admin = Usuario(
@@ -267,6 +276,221 @@ def test_consultar_cnpj_invalido_responde_400() -> None:
         raise AssertionError("CNPJ inválido deveria responder 400.")
 
 
+def test_fonte_notas_derivada_e_json_sem_segredo() -> None:
+    """Loja antiga (coluna nula) deriva a fonte e o JSON não expõe credencial."""
+    db, _usuario_a, _usuario_b = _banco_com_duas_contas()
+    loja = db.query(Empresa).filter(Empresa.cnpj == CNPJ_CONTA_A).one()
+
+    # Sem fonte gravada e sem credencial: fluxo histórico = certificado A1.
+    assert backend_main._fonte_notas_da_loja(loja) == "certificado"
+    dados = backend_main._empresa_json(loja)
+    assert dados["fonte_notas"] == "certificado", dados
+    assert dados["cert_concordancia"] is None, dados
+    assert dados["omie_configurado"] is False, dados
+
+    # Credencial Omie sem escolha explícita: a leitura passa a indicar Omie.
+    loja.omie_app_key = "fernet:v1:chave"
+    loja.omie_app_secret = "fernet:v1:segredo"
+    db.commit()
+    assert backend_main._fonte_notas_da_loja(loja) == "omie"
+    dados = backend_main._empresa_json(loja)
+    assert dados["omie_configurado"] is True, dados
+    # Nem o texto cifrado nem o segredo saem na resposta da tela.
+    assert "fernet:v1" not in str(dados), dados
+
+    # A escolha explícita da tela prevalece sobre a derivação.
+    loja.fonte_notas = "certificado"
+    assert backend_main._fonte_notas_da_loja(loja) == "certificado"
+
+
+def test_fonte_notas_certificado_exige_concordancia_e_registra() -> None:
+    """Certificado só ativa com o aceite e a data/usuário ficam persistidos."""
+    db, usuario_a, _usuario_b = _banco_com_duas_contas()
+    loja = db.query(Empresa).filter(Empresa.cnpj == CNPJ_CONTA_A).one()
+
+    codigo, detalhe = _erro_http(
+        backend_main.definir_fonte_notas_da_loja,
+        empresa_id=loja.id,
+        dados=backend_main.FonteNotasRequest(fonte="certificado"),
+        usuario=usuario_a,
+        db=db,
+    )
+    assert codigo == 400, (codigo, detalhe)
+    assert "concord" in detalhe.lower(), detalhe
+    assert loja.cert_concordancia_em is None
+
+    resposta = backend_main.definir_fonte_notas_da_loja(
+        empresa_id=loja.id,
+        dados=backend_main.FonteNotasRequest(
+            fonte="certificado", concordancia_sefaz=True
+        ),
+        usuario=usuario_a,
+        db=db,
+    )
+    assert resposta["sucesso"] is True, resposta
+    empresa_json = resposta["empresa"]
+    assert empresa_json["fonte_notas"] == "certificado", empresa_json
+    concordancia = empresa_json["cert_concordancia"]
+    assert concordancia and concordancia["em"], empresa_json
+    assert concordancia["por"] == usuario_a.email, concordancia
+    # A mensagem avisa que ainda falta enviar o .pfx ao cadastrar a loja.
+    assert ".pfx" in resposta["mensagem"], resposta
+
+    db.expire_all()
+    persistida = db.get(Empresa, loja.id)
+    assert persistida.fonte_notas == "certificado", persistida.fonte_notas
+    assert persistida.cert_concordancia_em == concordancia["em"]
+    assert persistida.cert_concordancia_por == usuario_a.email
+
+
+def test_fonte_notas_omie_exige_credencial_e_respeita_dono() -> None:
+    """Troca para Omie sem credencial = 400; loja de outra conta = 403."""
+    db, usuario_a, usuario_b = _banco_com_duas_contas()
+    loja_a = db.query(Empresa).filter(Empresa.cnpj == CNPJ_CONTA_A).one()
+    admin = _criar_admin(db)
+
+    codigo, detalhe = _erro_http(
+        backend_main.definir_fonte_notas_da_loja,
+        empresa_id=loja_a.id,
+        dados=backend_main.FonteNotasRequest(fonte="omie"),
+        usuario=usuario_a,
+        db=db,
+    )
+    assert codigo == 400, (codigo, detalhe)
+    assert "App Key" in detalhe, detalhe
+
+    codigo, _detalhe = _erro_http(
+        backend_main.definir_fonte_notas_da_loja,
+        empresa_id=loja_a.id,
+        dados=backend_main.FonteNotasRequest(fonte="omie"),
+        usuario=usuario_b,
+        db=db,
+    )
+    assert codigo == 403, codigo
+
+    loja_a.omie_app_key = "fernet:v1:chave"
+    loja_a.omie_app_secret = "fernet:v1:segredo"
+    db.commit()
+    resposta = backend_main.definir_fonte_notas_da_loja(
+        empresa_id=loja_a.id,
+        dados=backend_main.FonteNotasRequest(fonte="omie"),
+        usuario=usuario_a,
+        db=db,
+    )
+    assert resposta["empresa"]["fonte_notas"] == "omie", resposta
+
+    # Fonte desconhecida é recusada antes de gravar qualquer coisa.
+    codigo, _detalhe = _erro_http(
+        backend_main.definir_fonte_notas_da_loja,
+        empresa_id=loja_a.id,
+        dados=backend_main.FonteNotasRequest(fonte="planilha"),
+        usuario=usuario_a,
+        db=db,
+    )
+    assert codigo == 400, codigo
+
+    # Admin (suporte) também troca a fonte de uma loja de cliente.
+    loja_b = db.query(Empresa).filter(Empresa.cnpj == CNPJ_CONTA_B).one()
+    loja_b.omie_app_key = "fernet:v1:chave"
+    loja_b.omie_app_secret = "fernet:v1:segredo"
+    db.commit()
+    resposta_admin = backend_main.definir_fonte_notas_da_loja(
+        empresa_id=loja_b.id,
+        dados=backend_main.FonteNotasRequest(fonte="omie"),
+        usuario=admin,
+        db=db,
+    )
+    assert resposta_admin["empresa"]["usuario_id"] == usuario_b.id, resposta_admin
+
+
+
+def test_excluir_certificado_limpa_concordancia() -> None:
+    """Apagar o certificado também apaga a concordância (ela vale para ele)."""
+    db, usuario_a, _usuario_b = _banco_com_duas_contas()
+    loja = db.query(Empresa).filter(Empresa.cnpj == CNPJ_CONTA_A).one()
+    loja.certificado_titular = "EMPRESA A:07269638000171"
+    loja.certificado_validade = "31/12/2027"
+    loja.certificado_enviado_em = "2026-11-24T09:00:00+00:00"
+    loja.cert_concordancia_em = "2026-11-24T09:05:00+00:00"
+    loja.cert_concordancia_por = usuario_a.email
+    db.commit()
+
+    resposta = backend_main.excluir_certificado_da_empresa(
+        empresa_id=loja.id, usuario=usuario_a, db=db
+    )
+    assert resposta["certificado_excluido"] is True, resposta
+    empresa_json = resposta["empresa"]
+    assert empresa_json["certificado"] is None, empresa_json
+    assert empresa_json["cert_concordancia"] is None, empresa_json
+    db.expire_all()
+    persistida = db.get(Empresa, loja.id)
+    assert persistida.cert_concordancia_em is None
+    assert persistida.cert_concordancia_por is None
+
+
+def test_cadastro_com_fonte_omie_dispensa_certificado() -> None:
+    """Vincular loja para o Omie não exige .pfx; o certificado continua barrado."""
+    import asyncio
+
+    db, usuario_a, _usuario_b = _banco_com_duas_contas()
+    cnpj_novo = "33445566000177"
+    with patch.object(
+        backend_main, "_consultar_cnpj", lambda cnpj: dict(ENDERECO_RECEITA)
+    ):
+        resposta = asyncio.run(
+            backend_main.cadastrar_empresa(
+                usuario=usuario_a,
+                db=db,
+                cnpj=cnpj_novo,
+                certificado=None,
+                fonte_notas="omie",
+            )
+        )
+    assert resposta["sucesso"] is True, resposta
+    empresa_json = resposta["empresa"]
+    assert empresa_json["cnpj"] == cnpj_novo, empresa_json
+    assert empresa_json["usuario_id"] == usuario_a.id, empresa_json
+    assert empresa_json["fonte_notas"] == "omie", empresa_json
+    assert empresa_json["certificado"] is None, empresa_json
+    assert empresa_json["cert_concordancia"] is None, empresa_json
+
+    # Fonte desconhecida é recusada.
+    outra = "77889900000155"
+    try:
+        asyncio.run(
+            backend_main.cadastrar_empresa(
+                usuario=usuario_a,
+                db=db,
+                cnpj=outra,
+                certificado=None,
+                fonte_notas="planilha",
+            )
+        )
+    except HTTPException as erro:
+        assert erro.status_code == 400, erro.status_code
+    else:
+        raise AssertionError("Fonte inválida deveria responder 400.")
+
+    # Sem o aceite (false explícito) o certificado nem é validado.
+    try:
+        asyncio.run(
+            backend_main.cadastrar_empresa(
+                usuario=usuario_a,
+                db=db,
+                cnpj=outra,
+                certificado=None,
+                fonte_notas="certificado",
+                concordancia_sefaz=False,
+            )
+        )
+    except HTTPException as erro:
+        assert erro.status_code == 400, erro.status_code
+        assert erro.detail == backend_main.certificados.ERRO_SEM_CONCORDANCIA
+    else:
+        raise AssertionError("Certificado sem concordância deveria responder 400.")
+
+
+
 def main() -> int:
     testes = (
         test_lojas_sem_token_responde_401,
@@ -278,6 +502,11 @@ def main() -> int:
         test_consultar_cnpj_proprio_traz_endereco_da_receita,
         test_consultar_cnpj_sem_receita_usa_endereco_gravado,
         test_consultar_cnpj_invalido_responde_400,
+        test_fonte_notas_derivada_e_json_sem_segredo,
+        test_fonte_notas_certificado_exige_concordancia_e_registra,
+        test_fonte_notas_omie_exige_credencial_e_respeita_dono,
+        test_excluir_certificado_limpa_concordancia,
+        test_cadastro_com_fonte_omie_dispensa_certificado,
     )
     falhas = 0
     for teste in testes:

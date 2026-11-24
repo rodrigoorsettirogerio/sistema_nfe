@@ -87,6 +87,13 @@ EMPRESA_ACBR_URL = f"{API_BASE}/api/acbr/empresas"
 # Diagnóstico/força do download da Distribuição NF-e por loja (tela Minhas Lojas).
 ACBR_BAIXAR_XMLS_URL = f"{API_BASE}/api/acbr/baixar-xmls"
 ACBR_STATUS_URL = f"{API_BASE}/api/acbr/status"
+# Fonte das notas por loja (fase 3a do frontend): Omie (API de recebimentos) ou
+# certificado digital A1 + Distribuição NF-e da SEFAZ. A troca de fonte e a
+# concordância obrigatória do aviso da SEFAZ passam por /fonte-notas.
+EMPRESA_FONTE_NOTAS_URL = f"{API_BASE}/api/empresas"
+OMIE_CREDENCIAIS_URL = f"{API_BASE}/api/omie/credenciais"
+OMIE_SINCRONIZAR_URL = f"{API_BASE}/api/omie/sincronizar"
+OMIE_STATUS_URL = f"{API_BASE}/api/omie/status"
 # Motor de alertas (WhatsApp): preferências do cliente, simulador do disparo e o token
 # global da API (este último só o administrador, na aba ⚙️ Configurações da Auditoria).
 ALERTAS_CONFIG_URL = f"{API_BASE}/api/alertas/configurar"
@@ -237,6 +244,35 @@ CHAVE_CONFIRMACAO_EXCLUSAO_CERT = "confirmacao_exclusao_cert_key"
 # Marca que os checkboxes "Confirmar exclusão" devem ser desmarcados no próximo run
 # (depois de excluir o certificado ou de concluir o cadastro de uma loja).
 LIMPAR_CONFIRMACAO_EXCLUSAO_CERT = "_limpar_confirmacao_exclusao_cert"
+# ── Fonte das notas da loja (Omie x certificado A1) ───────────────────────────
+# Rótulos do seletor. O dicionário converte o rótulo exibido no radio para o
+# valor que o backend grava em `empresas.fonte_notas`.
+ROTULO_FONTE_OMIE = "Omie (API de recebimentos)"
+ROTULO_FONTE_CERTIFICADO = "Certificado digital A1 (baixar direto da SEFAZ)"
+FONTES_NOTAS = {
+    ROTULO_FONTE_OMIE: "omie",
+    ROTULO_FONTE_CERTIFICADO: "certificado",
+}
+# MESMO texto de backend/certificados.py (TEXTO_CONCORDANCIA_SEFAZ): a tela mostra
+# no checkbox e o backend cobra/grava a concordância. Manter os dois iguais.
+TEXTO_CONCORDANCIA_SEFAZ = (
+    "Confirmo que as notas fiscais desta empresa NÃO são baixadas em nenhum outro "
+    "sistema (contabilidade, sistema de retaguarda, etc.), para evitar conflito na "
+    "distribuição da SEFAZ."
+)
+# Loja escolhida no seletor de fonte; versão dos widgets (radio/checkbox) para
+# forçar a recriação com o valor gravado depois de salvar a fonte, e mensagem que
+# sobrevive ao `st.rerun`.
+SESSAO_LOJA_FONTE_NOTAS = "fonte_notas_loja_selecionada"
+PREFIXO_WIDGET_FONTE_NOTAS = "fonte_notas_loja_"
+CHAVE_VERSAO_FONTE_NOTAS = "_fonte_notas_versao"
+MENSAGEM_FONTE_NOTAS = "_mensagem_fonte_notas"
+# Fonte escolhida no formulário "Vincular novo CNPJ" (fora do `st.form`, porque o
+# radio precisa de run para mostrar os campos certos) e o aceite do aviso da SEFAZ.
+NOVA_LOJA_FONTE_NOTAS = "nova_loja_fonte_notas"
+NOVA_LOJA_CONCORDANCIA_SEFAZ = "nova_loja_concordancia_sefaz"
+NOVA_LOJA_OMIE_APP_KEY = "nova_loja_omie_app_key"
+NOVA_LOJA_OMIE_APP_SECRET = "nova_loja_omie_app_secret"
 # Clique em "Enviar e-mail real": guarda a confirmação entre o submit do formulário e
 # os botões Confirmar/Cancelar (o Streamlit reexecuta a página a cada clique).
 SESSAO_CONFIRMAR_EMAIL_ALERTA = "_confirmar_email_alerta"
@@ -780,7 +816,13 @@ def _renderizar_diagnostico_cadastro(diagnostico):
 
 
 def cadastrar_loja(
-    cnpj, arquivo=None, senha_certificado="", diagnostico=None, enviar_acbr=True
+    cnpj,
+    arquivo=None,
+    senha_certificado="",
+    diagnostico=None,
+    enviar_acbr=True,
+    fonte_notas="",
+    concordancia_sefaz=False,
 ):
     """Vincula um CNPJ à conta e envia o certificado à ACBr.
 
@@ -792,6 +834,10 @@ def cadastrar_loja(
     ``enviar_acbr=False`` executa só o vínculo. A tela "Minhas Lojas" usa isso
     para fazer o ``POST /api/acbr/empresas`` por conta própria, dentro do seu
     próprio ``try/except``, mostrando na tela o status e o JSON crus da resposta.
+
+    ``fonte_notas="omie"`` vincula a loja SEM certificado (as notas vêm da API
+    do Omie); ``concordancia_sefaz=True`` registra o aceite do aviso da SEFAZ
+    junto com o certificado — o backend recusa o envio com ``false``.
 
     ``diagnostico`` é um dict opcional preenchido com URL, status HTTP, tempo e
     trecho da resposta de cada POST, além dos ``requests.Response`` crus em
@@ -817,11 +863,21 @@ def cadastrar_loja(
             "certificado": nome_certificado,
             "certificado_bytes": len(conteudo_certificado or b""),
             "senha_informada": bool((senha_certificado or "").strip()),
+            "fonte_notas": fonte_notas or "certificado",
+            "concordancia_sefaz": bool(concordancia_sefaz),
             "token_enviado": bool(st.session_state.get(SESSAO_TOKEN)),
             "etapas": [],
         }
     )
-    dados = {"cnpj": cnpj, "senha_certificado": senha_certificado or ""}
+    dados = {
+        "cnpj": cnpj,
+        "senha_certificado": senha_certificado or "",
+        "fonte_notas": fonte_notas or "",
+    }
+    if concordancia_sefaz:
+        # A tela SEMPRE envia quando o checkbox está marcado; omitir = chamada
+        # legada (o backend mantém compatibilidade com scripts/testes).
+        dados["concordancia_sefaz"] = "true"
     arquivos = None
     if arquivo is not None:
         arquivos = {
@@ -927,7 +983,11 @@ def cadastrar_loja(
     try:
         resposta_acbr = requests.post(
             EMPRESA_ACBR_URL,
-            data={"cnpj": cnpj, "senha_certificado": senha_certificado or ""},
+            data={
+                "cnpj": cnpj,
+                "senha_certificado": senha_certificado or "",
+                **({"concordancia_sefaz": "true"} if concordancia_sefaz else {}),
+            },
             files=arquivos,
             headers=cabecalhos_api(),
             timeout=90,
@@ -1095,6 +1155,132 @@ def excluir_certificado_loja(empresa_id):
         corpo = resposta.json() or {}
         return corpo.get("mensagem") or "Certificado excluído.", None
     return None, mensagem_de_erro(resposta)
+
+def _formatar_data_hora_brasilia(valor):
+    """ISO 8601 (UTC) no horário de Brasília — usado nos carimbos da tela.
+
+    O backend grava `omie_sync_em` e a concordância em UTC. Mostrar o horário
+    local evita a impressão de que a sincronização aconteceu "no futuro".
+    """
+    if not valor:
+        return "—"
+    try:
+        momento = pd.Timestamp(valor)
+        if momento.tzinfo is not None:
+            momento = momento.tz_convert("America/Sao_Paulo")
+        return momento.strftime("%d/%m/%Y %H:%M")
+    except Exception:
+        return str(valor)
+
+
+def _incrementar_versao_fonte_notas():
+    """Força a recriação do radio/checkbox do seletor de fonte no próximo run.
+
+    O Streamlit mantém o valor de um widget cuja chave continua na sessão; depois
+    de salvar a fonte precisamos que o widget volte com o valor GRAVADO no banco.
+    """
+    versao = st.session_state.get(CHAVE_VERSAO_FONTE_NOTAS, 0)
+    if not isinstance(versao, int):
+        versao = 0
+    st.session_state[CHAVE_VERSAO_FONTE_NOTAS] = versao + 1
+
+
+def salvar_credenciais_omie(cnpj, app_key, app_secret):
+    """POST ``/api/omie/credenciais``: grava o par cifrado no backend.
+
+    Retorna ``(dados, erro)``. O backend nunca devolve o segredo inteiro — só a
+    máscara dos 4 últimos caracteres; a tela usa isso como confirmação.
+    """
+    try:
+        resposta = requests.post(
+            OMIE_CREDENCIAIS_URL,
+            json={
+                "cnpj": re.sub(r"\D", "", str(cnpj or "")),
+                "app_key": str(app_key or "").strip(),
+                "app_secret": str(app_secret or "").strip(),
+            },
+            headers=cabecalhos_api(),
+            timeout=60,
+        )
+    except Exception as erro:
+        return None, f"Não foi possível conectar ao servidor da API: {erro}"
+    if resposta.status_code == 200:
+        return resposta.json() or {}, None
+    return None, mensagem_de_erro(resposta)
+
+
+def sincronizar_omie(cnpj, simular=True):
+    """POST ``/api/omie/sincronizar``: importa os recebimentos da loja.
+
+    ``simular=True`` roda tudo e desfaz no fim (nada é gravado). O backend usa a
+    janela/etapas padrão quando o corpo não traz datas. Retorna ``(dados, erro)``.
+    """
+    try:
+        resposta = requests.post(
+            OMIE_SINCRONIZAR_URL,
+            json={
+                "cnpj": re.sub(r"\D", "", str(cnpj or "")),
+                "simular": bool(simular),
+            },
+            headers=cabecalhos_api(),
+            timeout=900,
+        )
+    except Exception as erro:
+        return None, f"Não foi possível conectar ao servidor da API: {erro}"
+    if resposta.status_code == 200:
+        return resposta.json() or {}, None
+    return None, mensagem_de_erro(resposta)
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def consultar_status_omie(cnpj, token):
+    """GET ``/api/omie/status/{cnpj}``: última sync, contagens e credencial.
+
+    O cache de 30 s evita repetir a consulta a cada interação da tela (o
+    Streamlit reexecuta o script inteiro a cada clique). Retorna ``(dados, erro)``;
+    a resposta nunca inclui o app_secret.
+    """
+    cnpj_limpo = re.sub(r"\D", "", str(cnpj or ""))
+    try:
+        resposta = requests.get(
+            f"{OMIE_STATUS_URL}/{quote(cnpj_limpo, safe='')}",
+            headers={"Authorization": f"Bearer {token}"} if token else {},
+            timeout=60,
+        )
+    except Exception as erro:
+        return None, f"Não foi possível consultar o status do Omie: {erro}"
+    if resposta.status_code == 200:
+        try:
+            return resposta.json() or {}, None
+        except ValueError:
+            return None, "A API respondeu ao status do Omie em formato inválido."
+    return None, mensagem_de_erro(resposta)
+
+
+def definir_fonte_notas_loja(empresa_id, fonte, concordancia_sefaz=False):
+    """POST ``/api/empresas/{id}/fonte-notas``: ativa Omie ou certificado A1.
+
+    A fonte ``"certificado"`` só é aceita com ``concordancia_sefaz=True`` — o
+    backend grava data/hora + e-mail de quem confirmou o aviso. Retorna
+    ``(dados, erro)``.
+    """
+    try:
+        resposta = requests.post(
+            f"{EMPRESA_FONTE_NOTAS_URL}/{int(empresa_id)}/fonte-notas",
+            json={
+                "fonte": str(fonte or "").strip().lower(),
+                "concordancia_sefaz": bool(concordancia_sefaz),
+            },
+            headers=cabecalhos_api(),
+            timeout=60,
+        )
+    except Exception as erro:
+        return None, f"Não foi possível conectar ao servidor da API: {erro}"
+    if resposta.status_code == 200:
+        return resposta.json() or {}, None
+    return None, mensagem_de_erro(resposta)
+
+
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -6796,6 +6982,20 @@ def _cartao_empresa(empresa, mostrar_acoes_acbr=False):
             st.caption(
                 "🔐 Sem certificado digital cadastrado — vincule o CNPJ novamente com o .pfx."
             )
+        # Fonte das notas escolhida na tela (Omie x certificado A1). A concordância
+        # da SEFAZ só vale para o certificado: sem ela o download fica pendente.
+        if (empresa.get("fonte_notas") or "certificado") == "omie":
+            st.caption("📥 Fonte das notas: **Omie**")
+        else:
+            st.caption("📥 Fonte das notas: **Certificado digital A1 (SEFAZ)**")
+            concordancia = empresa.get("cert_concordancia") or {}
+            if concordancia.get("em"):
+                st.caption(
+                    "✅ Concordância SEFAZ: "
+                    f"{_formatar_data_hora_brasilia(concordancia['em'])}"
+                )
+            else:
+                st.caption("⚠️ Concordância SEFAZ: pendente de confirmação")
         nsu = str(empresa.get("ultimo_nsu_acbr") or "").strip()
         if not nsu or nsu == "0":
             nsu = "Aguardando primeiro download"
@@ -6829,6 +7029,12 @@ def _limpar_formulario_minhas_lojas():
     """
     st.session_state["nova_loja_cnpj"] = ""
     st.session_state["nova_loja_senha_certificado"] = ""
+    # Fonte Omie do cadastro: credenciais e o aceite da SEFAZ não pertencem à
+    # próxima loja. O radio volta ao certificado (fluxo histórico como padrão).
+    st.session_state[NOVA_LOJA_FONTE_NOTAS] = ROTULO_FONTE_CERTIFICADO
+    st.session_state[NOVA_LOJA_CONCORDANCIA_SEFAZ] = False
+    st.session_state[NOVA_LOJA_OMIE_APP_KEY] = ""
+    st.session_state[NOVA_LOJA_OMIE_APP_SECRET] = ""
     # O endereço fiscal também nasce vazio (é o mesmo dado da loja recém-criada).
     for chave in CAMPOS_ENDERECO_MINHAS_LOJAS.values():
         st.session_state[chave] = ""
@@ -7093,6 +7299,271 @@ def _mensagem_vinculo_loja(cnpj, nome_loja="", admin=False):
     return texto
 
 
+def _painel_certificado_loja(empresa, versao):
+    """Aviso + concordância obrigatória + status do certificado A1 da loja."""
+    empresa_id = empresa.get("id")
+    certificado = empresa.get("certificado") or {}
+    concordancia = empresa.get("cert_concordancia") or {}
+
+    st.warning(
+        "⚠️ **Atenção antes de ativar o certificado digital:** a SEFAZ entrega "
+        "cada nota para **um único sistema**. Baixar as mesmas notas em dois "
+        "lugares (aqui e na contabilidade/retaguarda) faz um dos sistemas perder "
+        "a distribuição.\n\n"
+        + TEXTO_CONCORDANCIA_SEFAZ
+    )
+    if certificado.get("validade"):
+        st.caption(
+            f"🔐 Certificado A1 válido até {certificado['validade']} "
+            f"(enviado em {formatar_data(certificado.get('enviado_em'))})."
+        )
+    else:
+        st.warning(
+            "Esta loja ainda não tem o certificado A1 cadastrado. Depois de "
+            "confirmar a concordância, envie o .pfx/.p12 e a senha no formulário "
+            "**Vincular novo CNPJ** abaixo para ativar o download."
+        )
+    if concordancia.get("em"):
+        st.success(
+            "✅ Concordância registrada em "
+            f"{_formatar_data_hora_brasilia(concordancia['em'])}"
+            + (f" por {concordancia['por']}." if concordancia.get("por") else ".")
+        )
+    else:
+        st.caption("A concordância ainda não foi registrada para esta loja.")
+
+    confirmar = st.checkbox(
+        TEXTO_CONCORDANCIA_SEFAZ,
+        key=f"concordancia_sefaz_{empresa_id}_{versao}",
+        help=(
+            "O aceite fica gravado com data/hora e o e-mail da conta logada. "
+            "Sem ele o certificado não é ativado."
+        ),
+    )
+    if st.button(
+        "💾 Confirmar e ativar fonte Certificado A1",
+        key=f"btn_fonte_certificado_{empresa_id}",
+        width="stretch",
+        disabled=not confirmar,
+        help="O botão só habilita depois de marcar a concordância.",
+    ):
+        dados, erro = definir_fonte_notas_loja(empresa_id, "certificado", True)
+        if erro:
+            st.error(erro)
+        else:
+            st.session_state[MENSAGEM_FONTE_NOTAS] = (
+                dados.get("mensagem")
+                or "Fonte das notas definida como certificado digital A1 (SEFAZ)."
+            )
+            _incrementar_versao_fonte_notas()
+            st.cache_data.clear()
+            st.rerun()
+
+
+def _secao_fonte_notas(empresas):
+    """Seletor "Fonte das notas" por loja (Omie x certificado A1).
+
+    A lista `empresas` já vem recortada pelo backend: a conta comum vê só as
+    próprias lojas; o administrador vê todas (com o e-mail do dono no rótulo) e
+    pode gerenciar cada uma, como no restante da tela.
+    """
+    lojas = [empresa for empresa in empresas if empresa.get("id") is not None]
+    if not lojas:
+        return
+    mapa = {int(empresa["id"]): empresa for empresa in lojas}
+    ids = list(mapa)
+
+    st.subheader("⚙️ Fonte das notas por loja")
+    st.caption(
+        "Cada loja baixa as notas de **um único lugar**. Escolha **Omie** quando "
+        "os recebimentos já estão no Omie ou **Certificado A1** para baixar "
+        "direto da SEFAZ — nunca os dois para a mesma empresa."
+    )
+    selecionado = st.session_state.get(SESSAO_LOJA_FONTE_NOTAS)
+    if selecionado not in ids:
+        st.session_state[SESSAO_LOJA_FONTE_NOTAS] = ids[0]
+    escolhido = st.selectbox(
+        "Loja",
+        ids,
+        key=SESSAO_LOJA_FONTE_NOTAS,
+        format_func=lambda empresa_id: _rotulo_loja_fonte(mapa[int(empresa_id)]),
+    )
+    empresa = mapa[int(escolhido)]
+    versao = st.session_state.get(CHAVE_VERSAO_FONTE_NOTAS, 0)
+    if not isinstance(versao, int):
+        versao = 0
+    atual = str(empresa.get("fonte_notas") or "certificado").lower()
+    fonte_rotulo = st.radio(
+        "Fonte das notas desta loja",
+        list(FONTES_NOTAS),
+        index=0 if atual == "omie" else 1,
+        key=f"{PREFIXO_WIDGET_FONTE_NOTAS}{empresa['id']}_{versao}",
+        horizontal=True,
+        help=(
+            "Omie: importa os recebimentos pela API. Certificado A1: baixa os "
+            "XMLs direto da Distribuição NF-e da SEFAZ."
+        ),
+    )
+    if FONTES_NOTAS.get(fonte_rotulo) == "omie":
+        _painel_omie_loja(empresa)
+    else:
+        _painel_certificado_loja(empresa, versao)
+
+
+def _painel_omie_loja(empresa):
+    """Credenciais + sincronização manual da fonte Omie de UMA loja."""
+    empresa_id = empresa.get("id")
+    cnpj = empresa.get("cnpj") or ""
+    status, erro_status = consultar_status_omie(
+        cnpj, st.session_state.get(SESSAO_TOKEN)
+    )
+    if erro_status:
+        st.warning(erro_status)
+    else:
+        _renderizar_resumo_omie(status)
+
+    st.caption(
+        "As credenciais são do aplicativo criado em **app.omie.com.br** e ficam "
+        "**cifradas no banco** — o App Secret não é exibido de volta."
+    )
+    with st.form(key=f"form_credenciais_omie_{empresa_id}"):
+        app_key = st.text_input(
+            "App Key do Omie",
+            key=f"omie_app_key_{empresa_id}",
+            help="Chave do aplicativo Omie desta loja.",
+        )
+        app_secret = st.text_input(
+            "App Secret do Omie",
+            type="password",
+            key=f"omie_app_secret_{empresa_id}",
+            help="Segredo do mesmo aplicativo. Gravado cifrado e nunca reexibido.",
+        )
+        salvar = st.form_submit_button("💾 Salvar credenciais do Omie")
+    if salvar:
+        if not (app_key or "").strip() or not (app_secret or "").strip():
+            st.error("Informe o App Key e o App Secret do Omie para salvar.")
+        else:
+            dados, erro = salvar_credenciais_omie(cnpj, app_key, app_secret)
+            if erro:
+                st.error(erro)
+            else:
+                st.session_state[MENSAGEM_FONTE_NOTAS] = (
+                    dados.get("mensagem")
+                    or "Credenciais do Omie gravadas (cifradas no banco)."
+                )
+                # O backend também ativa a fonte Omie; a versão nova faz o radio
+                # e o cartão voltarem com o valor gravado.
+                _incrementar_versao_fonte_notas()
+                st.cache_data.clear()
+                st.rerun()
+
+    st.divider()
+    simular = st.checkbox(
+        "Simular (busca os recebimentos e não grava nada)",
+        value=True,
+        key=f"omie_simular_{empresa_id}",
+        help=(
+            "A simulação é o teste seguro: mostra quantas notas/itens entrariam "
+            "sem alterar a base. Desmarque para gravar de verdade."
+        ),
+    )
+    if st.button(
+        "🔄 Sincronizar agora",
+        key=f"btn_sincronizar_omie_{empresa_id}",
+        width="stretch",
+        help="Usa a janela padrão e as etapas do backend (Faturado/Recebido/Conferido).",
+    ):
+        with st.spinner(
+            "Consultando os recebimentos do Omie... A simulação também pode "
+            "levar alguns minutos."
+        ):
+            dados, erro = sincronizar_omie(cnpj, simular=simular)
+        if erro:
+            st.error(erro)
+        else:
+            contagens = dados.get("contagens") or {}
+            rotulo = (
+                "Simulação concluída (nada foi gravado)"
+                if dados.get("simulado")
+                else "Sincronização concluída"
+            )
+            st.success(
+                f"{rotulo}: {int(contagens.get('novas') or 0)} nota(s) nova(s), "
+                f"{int(contagens.get('duplicadas') or 0)} duplicada(s) e "
+                f"{int(contagens.get('itens') or 0)} item(ns)."
+            )
+            resumo = dados.get("resumo") or {}
+            erros = resumo.get("erros") or []
+            if erros:
+                with st.expander(f"⚠️ Avisos da sincronização ({len(erros)})"):
+                    for aviso in erros:
+                        st.caption(f"• {aviso}")
+            if not dados.get("simulado"):
+                # Os relatórios passam a refletir as notas importadas.
+                st.cache_data.clear()
+
+
+def _rotulo_loja_fonte(empresa):
+    """Rótulo do seletor de fonte: loja + CNPJ (+ dono, na visão do admin)."""
+    nome = empresa.get("nome_loja") or empresa.get("razao_social") or "Loja"
+    rotulo = f"{nome} — {formatar_cnpj(empresa.get('cnpj'))}"
+    dono = str(empresa.get("dono_email") or "").strip()
+    if dono:
+        rotulo += f" (conta: {dono})"
+    return rotulo
+
+
+def _renderizar_resumo_omie(status):
+    """Resumo da integração Omie no painel da loja (sem expor o app_secret)."""
+    if not isinstance(status, dict) or not status:
+        return
+    erro_credenciais = status.get("erro_credenciais")
+    if erro_credenciais:
+        st.error(
+            "A credencial do Omie gravada nesta loja não pôde ser lida "
+            f"({erro_credenciais}). Grave o App Key/App Secret novamente."
+        )
+    if not status.get("configurado"):
+        st.info(
+            "Nenhuma credencial do Omie configurada para esta loja. Grave o "
+            "**App Key** e o **App Secret** abaixo (ficam cifrados no banco)."
+        )
+        return
+    origem = status.get("origem_credenciais")
+    onde = (
+        "gravada nesta loja"
+        if origem == "empresa"
+        else "vinda do .env do servidor (loja ainda sem credencial própria)"
+    )
+    st.caption(
+        f"🔑 App Key `{status.get('app_key') or '—'}` — {onde} | "
+        f"segredo {'configurado' if status.get('app_secret_configurado') else 'ausente'}"
+    )
+    ultima = status.get("ultima_sincronizacao") or {}
+    sincronizado = status.get("omie_sync_em") or ultima.get("sincronizado_em")
+    if sincronizado:
+        st.caption(
+            "🕒 Última sincronização: "
+            f"{_formatar_data_hora_brasilia(sincronizado)}"
+        )
+    else:
+        st.caption("🕒 Nenhuma sincronização concluída ainda.")
+    contagens = status.get("contagens") or {}
+    if contagens:
+        st.caption(
+            f"📄 Notas novas: {int(contagens.get('novas') or 0)} | "
+            f"duplicadas: {int(contagens.get('duplicadas') or 0)} | "
+            f"itens: {int(contagens.get('itens') or 0)} | "
+            f"recebimentos: {int(contagens.get('recebimentos') or 0)}"
+        )
+    erros = ultima.get("erros") or []
+    if erros:
+        with st.expander(f"⚠️ Avisos da última sincronização ({len(erros)})"):
+            for aviso in erros:
+                st.caption(f"• {aviso}")
+
+
+
 def renderizar_minhas_lojas(empresas, erro_api=None):
     """Tela 'Minhas Lojas': CNPJs da conta e cadastro de novas lojas."""
     # A tela fica marcada como a página atual em todo run: o roteador cai em
@@ -7141,6 +7612,9 @@ def renderizar_minhas_lojas(empresas, erro_api=None):
     aviso_cadastro = st.session_state.pop(MENSAGEM_MINHAS_LOJAS, None)
     if aviso_cadastro:
         st.success(aviso_cadastro)
+    aviso_fonte = st.session_state.pop(MENSAGEM_FONTE_NOTAS, None)
+    if aviso_fonte:
+        st.success(aviso_fonte)
     resultado_cadastro = st.session_state.pop(RESULTADO_CADASTRO_MINHAS_LOJAS, None)
     if isinstance(resultado_cadastro, dict) and resultado_cadastro:
         nome_nova = str(
@@ -7177,6 +7651,11 @@ def renderizar_minhas_lojas(empresas, erro_api=None):
             f"Conta consultada: {usuario_sessao.get('email') or 'sem e-mail'} "
             f"(ID {usuario_sessao.get('id')})."
         )
+
+    if empresas:
+        # Fonte das notas de cada loja (Omie x certificado A1) + concordância
+        # obrigatória do aviso da SEFAZ. Fica acima do cadastro de CNPJ novo.
+        _secao_fonte_notas(empresas)
 
     st.divider()
     st.subheader("➕ Vincular novo CNPJ")
@@ -7258,35 +7737,160 @@ def renderizar_minhas_lojas(empresas, erro_api=None):
                 "Endereço preenchido pelo CEP. Confira o número e o complemento."
             )
 
-    st.caption(
-        "🔐 **Certificado digital obrigatório:** envie o certificado A1 da empresa "
-        "(.pfx/.p12) e a senha dele. Sem os dois o servidor recusa o vínculo. "
-        "Depois de salvar, o sistema baixa e importa as notas automaticamente."
+    # ── Fonte da nova loja FORA do `st.form` ───────────────────────────────────
+    # O radio precisa de run para trocar o formulário (upload do certificado x
+    # App Key/App Secret do Omie); dentro de um `st.form` nada dispara até o
+    # submit. O padrão é o certificado (fluxo histórico).
+    fonte_nova_rotulo = st.radio(
+        "Como as notas fiscais desta loja serão baixadas?",
+        [ROTULO_FONTE_OMIE, ROTULO_FONTE_CERTIFICADO],
+        index=1,
+        key=NOVA_LOJA_FONTE_NOTAS,
+        horizontal=True,
+        help=(
+            "Omie: importa os recebimentos pela API. Certificado A1: baixa os "
+            "XMLs direto da SEFAZ. Escolha apenas um — as mesmas notas não podem "
+            "ser baixadas em dois sistemas."
+        ),
     )
-    # `st.form`: certificado, senha e o botão de salvar ficam juntos para o envio só
-    # acontecer no submit (sem run intermediário durante a janela do arquivo). O
-    # endereço está FORA do formulário porque o CEP precisa de `on_change`; os valores
-    # continuam nos widgets/sessão até o clique em "Salvar e vincular loja".
+    fonte_nova = FONTES_NOTAS.get(fonte_nova_rotulo, "certificado")
+    if fonte_nova == "omie":
+        st.caption(
+            "🔑 **Fonte Omie:** informe o App Key e o App Secret do aplicativo "
+            "criado em app.omie.com.br. O certificado A1 não é necessário e os "
+            "segredos ficam **cifrados no banco**. Depois de vincular, a loja "
+            "aparece acima para sincronizar os recebimentos."
+        )
+    else:
+        st.caption(
+            "🔐 **Certificado digital obrigatório:** envie o certificado A1 da "
+            "empresa (.pfx/.p12) e a senha dele, depois de confirmar a "
+            "concordância com o aviso da SEFAZ. Sem o arquivo e a senha o "
+            "servidor recusa o vínculo. Depois de salvar, o sistema baixa e "
+            "importa as notas automaticamente."
+        )
+    # `st.form`: certificado/credenciais, senha e o botão de salvar ficam juntos
+    # para o envio só acontecer no submit (sem run intermediário durante a janela
+    # do arquivo). O endereço está FORA do formulário porque o CEP precisa de
+    # `on_change`; os valores continuam nos widgets/sessão até o clique em
+    # "Salvar e vincular loja".
+    certificado = None
+    senha_certificado = ""
+    concordancia_nova = False
+    omie_app_key = ""
+    omie_app_secret = ""
     with st.form(key="form_vincular_loja", clear_on_submit=False):
-        certificado = st.file_uploader(
-            "Certificado digital A1 (.pfx ou .p12)",
-            type=["pfx", "p12"],
-            key=_chave_uploader_certificado(),
-            help=(
-                "Arquivo do certificado A1 da empresa. O backend confere a senha e guarda "
-                "apenas o titular e a validade — o arquivo não é gravado no banco."
-            ),
-        )
-        senha_certificado = st.text_input(
-            "Senha do certificado digital",
-            type="password",
-            key="nova_loja_senha_certificado",
-            help="A mesma senha usada ao exportar/instalar o .pfx. Também não é gravada.",
-        )
+        if fonte_nova == "omie":
+            omie_app_key = st.text_input(
+                "App Key do Omie",
+                key=NOVA_LOJA_OMIE_APP_KEY,
+                help="Chave do aplicativo Omie desta loja.",
+            )
+            omie_app_secret = st.text_input(
+                "App Secret do Omie",
+                type="password",
+                key=NOVA_LOJA_OMIE_APP_SECRET,
+                help="Segredo do mesmo aplicativo. Gravado cifrado e nunca reexibido.",
+            )
+        else:
+            certificado = st.file_uploader(
+                "Certificado digital A1 (.pfx ou .p12)",
+                type=["pfx", "p12"],
+                key=_chave_uploader_certificado(),
+                help=(
+                    "Arquivo do certificado A1 da empresa. O backend confere a senha e guarda "
+                    "apenas o titular e a validade — o arquivo não é gravado no banco."
+                ),
+            )
+            senha_certificado = st.text_input(
+                "Senha do certificado digital",
+                type="password",
+                key="nova_loja_senha_certificado",
+                help="A mesma senha usada ao exportar/instalar o .pfx. Também não é gravada.",
+            )
+            st.warning(
+                "⚠️ **Antes de ativar o certificado:** a SEFAZ entrega cada nota "
+                "para **um único sistema**. Baixar as mesmas notas aqui e na "
+                "contabilidade/retaguarda faz um dos sistemas perder a "
+                "distribuição.\n\n" + TEXTO_CONCORDANCIA_SEFAZ
+            )
+            concordancia_nova = st.checkbox(
+                TEXTO_CONCORDANCIA_SEFAZ,
+                key=NOVA_LOJA_CONCORDANCIA_SEFAZ,
+                help=(
+                    "O aceite fica gravado com data/hora e o e-mail da conta "
+                    "logada. Sem ele o certificado não é salvo."
+                ),
+            )
         vincular = st.form_submit_button(
             "💾 Salvar e vincular loja", key="btn_vincular_loja", type="primary"
         )
     if not vincular:
+        return
+    if fonte_nova == "omie":
+        # Vínculo SEM certificado: o backend aceita `fonte_notas="omie"` e a
+        # credencial é gravada na chamada seguinte (cifrada). Sem as duas chaves
+        # não há como sincronizar — a tela pede antes de chamar a API.
+        digitos_omie = re.sub(r"\D", "", cnpj or "")
+        if not str(omie_app_key or "").strip() or not str(
+            omie_app_secret or ""
+        ).strip():
+            st.error(
+                "Informe o App Key e o App Secret do Omie para vincular a loja "
+                "com essa fonte."
+            )
+            return
+        empresa_omie, _mensagem_omie, erro_omie = cadastrar_loja(
+            digitos_omie,
+            None,
+            "",
+            fonte_notas="omie",
+            enviar_acbr=False,
+        )
+        if erro_omie:
+            st.error(erro_omie)
+            return
+        _dados_credenciais, erro_credenciais = salvar_credenciais_omie(
+            digitos_omie, omie_app_key, omie_app_secret
+        )
+        confirmada = empresa_omie or {}
+        cnpj_confirmado = confirmada.get("cnpj") or digitos_omie
+        nome_confirmado = confirmada.get("nome_loja") or ""
+        st.session_state[RESULTADO_CADASTRO_MINHAS_LOJAS] = {
+            "id": confirmada.get("id"),
+            "cnpj": cnpj_confirmado,
+            "nome_loja": nome_confirmado,
+            "razao_social": confirmada.get("razao_social") or "",
+            "mensagem": "Fonte das notas: Omie.",
+        }
+        mensagem_final = _mensagem_vinculo_loja(cnpj_confirmado, nome_confirmado)
+        if erro_credenciais:
+            mensagem_final += (
+                " ⚠️ A loja foi vinculada, mas as credenciais do Omie não foram "
+                f"gravadas: {erro_credenciais}. Use o painel da loja acima para "
+                "tentar novamente."
+            )
+        else:
+            mensagem_final += (
+                " Credenciais do Omie gravadas (cifradas no banco). Fonte das "
+                "notas: **Omie**."
+            )
+        st.session_state[MENSAGEM_MINHAS_LOJAS] = mensagem_final
+        # O formulário é limpo no PRÓXIMO run (o Streamlit não permite limpar um
+        # widget já instanciado no mesmo run).
+        st.session_state[LIMPAR_FORM_MINHAS_LOJAS] = True
+        st.session_state[LIMPAR_CONFIRMACAO_EXCLUSAO_CERT] = True
+        st.session_state.pop(DADOS_CNPJ_MINHAS_LOJAS, None)
+        st.session_state[ABRIR_ENDERECO_MINHAS_LOJAS] = False
+        st.cache_data.clear()
+        st.rerun()
+        return
+    if not concordancia_nova:
+        # Regra da tela (e do backend): sem o aceite o certificado não é salvo.
+        st.error(
+            "Marque a concordância de que as notas fiscais desta empresa NÃO são "
+            "baixadas em nenhum outro sistema antes de salvar o certificado."
+        )
         return
     # Endereço informado à mão: vai no POST da ACBr e o backend persiste na loja
     # (o formulário tem prioridade sobre o endereço já gravado e sobre a Receita).
@@ -7341,6 +7945,7 @@ def renderizar_minhas_lojas(empresas, erro_api=None):
                 senha_certificado,
                 diagnostico=diagnostico,
                 enviar_acbr=False,
+                concordancia_sefaz=concordancia_nova,
             )
     except Exception as e:  # noqa: BLE001 - a tela nunca pode falhar calada
         st.error(f"Erro: {e}")
@@ -7379,6 +7984,9 @@ def renderizar_minhas_lojas(empresas, erro_api=None):
                 data={
                     "cnpj": digitos,
                     "senha_certificado": senha_certificado or "",
+                    # Aceite obrigatório do aviso da SEFAZ (gravado pelo backend
+                    # junto com os dados públicos do certificado).
+                    "concordancia_sefaz": "true" if concordancia_nova else "false",
                     # Endereço fiscal digitado no expander: o backend usa este valor
                     # antes do endereço já gravado e do retorno da Receita.
                     **endereco_fiscal,
@@ -7452,6 +8060,9 @@ def renderizar_minhas_lojas(empresas, erro_api=None):
             "razao_social": confirmada.get("razao_social") or "",
             "mensagem": str(mensagem_acbr or mensagem or ""),
         }
+        # Enviar o certificado também define a fonte da loja como certificado:
+        # a versão nova faz o seletor de fonte reler o valor gravado.
+        _incrementar_versao_fonte_notas()
         # Os campos são limpos no PRÓXIMO run: o Streamlit não permite limpar um
         # widget já instanciado no mesmo run.
         st.session_state[LIMPAR_FORM_MINHAS_LOJAS] = True

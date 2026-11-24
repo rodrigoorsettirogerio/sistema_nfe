@@ -160,11 +160,14 @@ def test_credenciais_grava_cifrado_e_devolve_so_a_mascara():
     assert resposta["app_key"].startswith("*") and resposta["app_key"].endswith("1234")
     assert resposta["app_secret"].endswith("9876"), resposta
     assert resposta["configurado"] is True, resposta
+    # Gravar a credencial também ativa a fonte Omie da loja (seletor da tela).
+    assert resposta["fonte_notas"] == "omie", resposta
 
     db.expire_all()
     salva = db.get(Empresa, loja.id)
     assert salva.omie_app_key.startswith(bcripto.PREFIXO), salva.omie_app_key
     assert salva.omie_app_secret.startswith(bcripto.PREFIXO), salva.omie_app_secret
+    assert salva.fonte_notas == "omie", salva.fonte_notas
     assert APP_SECRET not in (salva.omie_app_key + salva.omie_app_secret)
     assert bcripto.descriptografar(salva.omie_app_secret) == APP_SECRET
 
@@ -249,6 +252,7 @@ def test_status_devolve_contagens_e_nunca_o_segredo():
 
     status = backend_main.status_omie(cnpj=CNPJ_A, usuario=dono, db=db)
     assert status["omie_sync_em"] == "2026-11-24T06:00:00+00:00", status
+    assert status["fonte_notas"] == "omie", status
     assert status["contagens"]["novas"] == 2, status
     assert status["contagens"]["itens"] == 5, status
     assert status["ultima_sincronizacao"]["periodo"] == [

@@ -40,6 +40,20 @@ ERRO_SUPORTE = (
     "(pip install cryptography). O vínculo de lojas está bloqueado."
 )
 
+# Concordância obrigatória antes de ativar o download direto na SEFAZ. O texto é
+# repetido no front (frontend/app.py) e cobrado pelo backend nas rotas que gravam
+# o certificado/ativam a fonte — nenhum dos dois lados pode "esquecer" o aviso.
+TEXTO_CONCORDANCIA_SEFAZ = (
+    "Confirmo que as notas fiscais desta empresa NÃO são baixadas em nenhum outro "
+    "sistema (contabilidade, sistema de retaguarda, etc.), para evitar conflito na "
+    "distribuição da SEFAZ."
+)
+ERRO_SEM_CONCORDANCIA = (
+    "Marque a concordância de que as notas fiscais desta empresa não são baixadas "
+    "em nenhum outro sistema (contabilidade, retaguarda etc.) antes de ativar o "
+    "certificado digital."
+)
+
 try:  # biblioteca padrão de PKCS#12 (cryptography). Sem ela o vínculo falha fechado.
     from cryptography import x509
     from cryptography.hazmat.primitives.serialization import pkcs12
@@ -217,13 +231,19 @@ def certificado_json(empresa) -> Optional[dict]:
 def limpar_certificado(empresa) -> bool:
     """Apaga os dados públicos do certificado da loja ("Excluir Certificado" na tela).
 
-    Só mexe nas três colunas de certificado: as notas, o dono e o nome da loja continuam
-    intactos (o histórico da loja não depende do certificado). Devolve True quando havia
-    algo para apagar — quem chama decide se responde 200 ou 400.
+    Só mexe nas colunas do certificado e na concordância SEFAZ (ela existe para o
+    certificado ativo: sem certificado, o aviso não vale mais): as notas, o dono e
+    o nome da loja continuam intactos (o histórico da loja não depende do
+    certificado). Devolve True quando havia algo para apagar — quem chama decide se
+    responde 200 ou 400.
     """
-    havia = bool(certificado_json(empresa))
+    havia = bool(certificado_json(empresa)) or bool(
+        getattr(empresa, "cert_concordancia_em", None)
+    )
     empresa.certificado_titular = None
     empresa.certificado_validade = None
     empresa.certificado_enviado_em = None
+    empresa.cert_concordancia_em = None
+    empresa.cert_concordancia_por = None
     return havia
 

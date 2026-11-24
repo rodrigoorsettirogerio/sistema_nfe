@@ -205,6 +205,36 @@ def _pode_gerenciar_loja(usuario: Usuario, empresa: Empresa) -> bool:
     return getattr(empresa, "usuario_id", None) == getattr(usuario, "id", None)
 
 
+def _fonte_notas_da_loja(empresa: Empresa) -> str:
+    """Fonte efetiva das notas da loja: ``"omie"`` ou ``"certificado"``.
+
+    A coluna ``fonte_notas`` só é gravada quando o cliente escolhe na tela. Nas
+    lojas antigas (NULL) a leitura deriva do que já existe: credencial do Omie
+    gravada -> Omie; caso contrário -> certificado A1 (o fluxo histórico, que
+    exige o .pfx para vincular a loja). Assim a tela sempre abre com uma opção
+    marcada, sem precisar migrar dados.
+    """
+    escolhida = str(getattr(empresa, "fonte_notas", "") or "").strip().lower()
+    if escolhida in ("omie", "certificado"):
+        return escolhida
+    if getattr(empresa, "omie_app_key", None) and getattr(
+        empresa, "omie_app_secret", None
+    ):
+        return "omie"
+    return "certificado"
+
+
+def _concordancia_sefaz_json(empresa: Empresa) -> Optional[dict]:
+    """Concordância SEFAZ registrada (None = ainda não confirmada/excluída)."""
+    registrada_em = str(getattr(empresa, "cert_concordancia_em", "") or "").strip()
+    if not registrada_em:
+        return None
+    return {
+        "em": registrada_em,
+        "por": str(getattr(empresa, "cert_concordancia_por", "") or "").strip(),
+    }
+
+
 def _empresa_json(empresa: Empresa, total_notas: Optional[int] = None) -> dict:
     """Empresa no formato usado pelo front (seletores e tela 'Minhas Lojas')."""
     dados = {
@@ -216,6 +246,17 @@ def _empresa_json(empresa: Empresa, total_notas: Optional[int] = None) -> dict:
         "usuario_id": empresa.usuario_id,
         # None quando a loja foi vinculada antes da barreira do certificado existir.
         "certificado": certificados.certificado_json(empresa),
+        # Fonte das notas escolhida na tela (Omie x certificado A1). Sempre
+        # preenchida: loja antiga é derivada do que ela já tem configurado.
+        "fonte_notas": _fonte_notas_da_loja(empresa),
+        # Data/hora + e-mail de quem marcou a concordância do certificado.
+        "cert_concordancia": _concordancia_sefaz_json(empresa),
+        # A tela mostra o painel do Omie e o "última sync" sem expor o segredo.
+        "omie_sync_em": empresa.omie_sync_em,
+        "omie_configurado": bool(
+            getattr(empresa, "omie_app_key", None)
+            and getattr(empresa, "omie_app_secret", None)
+        ),
         # "0"/vazio = loja ainda sem download da Distribuição NF-e.
         "ultimo_nsu_acbr": str(empresa.ultimo_nsu_acbr or "0"),
     }
@@ -224,11 +265,33 @@ def _empresa_json(empresa: Empresa, total_notas: Optional[int] = None) -> dict:
     return dados
 
 
+def _registrar_concordancia_sefaz(empresa: Empresa, usuario: Usuario) -> None:
+    """Grava data/hora (UTC) e o e-mail de quem aceitou o aviso do certificado.
+
+    Não grava o id do usuário: o e-mail é o que o suporte confere na tela e é o
+    mesmo campo devolvido pelo login. A data fica em ISO 8601 UTC, como os demais
+    carimbos do cadastro (`certificado_enviado_em`, `omie_sync_em`).
+    """
+    empresa.cert_concordancia_em = datetime.now(timezone.utc).isoformat(
+        timespec="seconds"
+    )
+    empresa.cert_concordancia_por = (
+        str(getattr(usuario, "email", "") or "").strip() or None
+    )
+
+
 def _aplicar_certificado(empresa: Empresa, dados: dict) -> None:
-    """Grava no cadastro da loja os dados PÚBLICOS do certificado já validado."""
+    """Grava no cadastro da loja os dados PÚBLICOS do certificado já validado.
+
+    Um certificado A1 validado também define a fonte das notas da loja: o
+    download direto da SEFAZ (ACBr). A escolha explícita da tela continua
+    prevalecendo até o cliente trocar de fonte.
+    """
     empresa.certificado_titular = dados.get("titular")
     empresa.certificado_validade = dados.get("validade")
     empresa.certificado_enviado_em = dados.get("enviado_em")
+    empresa.fonte_notas = "certificado"
+
 
 
 # Campos de endereço exigidos pelo contrato de `POST /empresas` da ACBr.
@@ -1177,6 +1240,20 @@ async def cadastrar_empresa(
     certificado: Optional[UploadFile] = File(
         None, description="Certificado digital A1 da empresa (.pfx ou .p12)"
     ),
+    fonte_notas: str = Form(
+        "",
+        description=(
+            "Fonte das notas: 'omie' (não exige certificado) ou 'certificado' "
+            "(padrão histórico). Vazio mantém a regra antiga (certificado)."
+        ),
+    ),
+    concordancia_sefaz: Optional[bool] = Form(
+        None,
+        description=(
+            "Concordância com o aviso de que as notas não são baixadas em outro "
+            "sistema. A tela envia true/false; omitido = chamada legada."
+        ),
+    ),
 ):
     """Cadastra o CNPJ e VINCULA a loja à conta logada (tela "Minhas Lojas").
 
@@ -1184,6 +1261,16 @@ async def cadastrar_empresa(
     .pfx/.p12 (`certificado`) e a `senha_certificado`: sem os dois o vínculo é bloqueado
     com 400 — nada é gravado. Só os dados públicos do certificado (titular/validade)
     ficam no banco; arquivo e senha não são persistidos (backend/certificados.py).
+
+    ``fonte_notas="omie"`` é a exceção: a loja baixa as notas pela API do Omie e NÃO
+    tem certificado A1, então o arquivo/senha não são exigidos. A tela usa esse
+    caminho quando o cliente escolhe "Omie" e grava as credenciais na sequência
+    (``POST /api/omie/credenciais``).
+
+    A concordância do aviso da SEFAZ (`concordancia_sefaz`) é gravada com data/hora
+    e e-mail de quem confirmou. O front sempre envia o campo; quando ele vem
+    explicitamente ``false`` a requisição é recusada. Omitido = cliente legado
+    (scripts/testes da barreira do certificado), que continua funcionando.
 
     Depois da barreira:
     - CNPJ novo: consulta a Receita (BrasilAPI) e cria a loja já com o dono;
@@ -1214,21 +1301,42 @@ async def cadastrar_empresa(
         usuario.email,
     )
 
-    conteudo_certificado = await certificado.read() if certificado is not None else None
-    try:
-        dados_certificado = certificados.validar_certificado(
-            certificado.filename if certificado is not None else None,
-            conteudo_certificado,
-            senha_certificado,
-            cnpj=cnpj_limpo,
+    # Em chamada direta (testes/scripts) os defaults do FastAPI são objetos
+    # `Form`, não strings: só um texto de verdade escolhe a fonte.
+    fonte_escolhida = (
+        fonte_notas.strip().lower() if isinstance(fonte_notas, str) else ""
+    )
+    if fonte_escolhida not in ("", "omie", "certificado"):
+        raise HTTPException(
+            status_code=400,
+            detail="Fonte das notas inválida: use 'omie' ou 'certificado'.",
         )
-    except HTTPException as erro:
-        logger.warning(
-            "Cadastro da loja %s recusado pelo certificado: %s",
-            cnpj_limpo,
-            erro.detail,
+    if fonte_escolhida == "omie":
+        # Loja que baixa do Omie não tem certificado A1: o .pfx e a senha não
+        # entram no vínculo. A credencial do Omie é gravada na rota seguinte.
+        dados_certificado = None
+    else:
+        if concordancia_sefaz is False:
+            raise HTTPException(
+                status_code=400, detail=certificados.ERRO_SEM_CONCORDANCIA
+            )
+        conteudo_certificado = (
+            await certificado.read() if certificado is not None else None
         )
-        raise
+        try:
+            dados_certificado = certificados.validar_certificado(
+                certificado.filename if certificado is not None else None,
+                conteudo_certificado,
+                senha_certificado,
+                cnpj=cnpj_limpo,
+            )
+        except HTTPException as erro:
+            logger.warning(
+                "Cadastro da loja %s recusado pelo certificado: %s",
+                cnpj_limpo,
+                erro.detail,
+            )
+            raise
 
     existente = db.query(Empresa).filter(Empresa.cnpj == cnpj_limpo).first()
     if existente:
@@ -1250,7 +1358,14 @@ async def cadastrar_empresa(
         adotada = existente.usuario_id is None
         if not gerenciada_pelo_admin:
             existente.usuario_id = dono_id
-        _aplicar_certificado(existente, dados_certificado)
+        if fonte_escolhida == "omie":
+            # Fonte Omie: não há certificado para aplicar. A credencial é gravada
+            # logo depois pela tela (POST /api/omie/credenciais).
+            existente.fonte_notas = "omie"
+        else:
+            _aplicar_certificado(existente, dados_certificado)
+            if concordancia_sefaz is True:
+                _registrar_concordancia_sefaz(existente, usuario)
         # Nome fantasia sempre vem da Receita (regra do cadastro): a loja renomeada
         # ("Moça Bar") não fica com o nome antigo.
         info = _consultar_cnpj(cnpj_limpo)
@@ -1276,6 +1391,11 @@ async def cadastrar_empresa(
             mensagem = f"A loja '{existente.nome_loja}' já estava na sua conta."
         if nome_atualizado:
             mensagem += " Nome atualizado com o Nome Fantasia da Receita."
+        if fonte_escolhida == "omie":
+            mensagem += (
+                " Fonte das notas: Omie — grave o App Key/App Secret para "
+                "sincronizar os recebimentos."
+            )
         return {
             "sucesso": True,
             "mensagem": mensagem,
@@ -1302,8 +1422,16 @@ async def cadastrar_empresa(
         municipio=info["municipio"],
         # Dono = conta logada (nunca o admin/fixo 1).
         usuario_id=dono_id,
+        # Loja nova já nasce com a fonte escolhida; vazio = o fluxo histórico
+        # (certificado) grava "certificado" em `_aplicar_certificado`.
+        fonte_notas=fonte_escolhida or None,
     )
-    _aplicar_certificado(nova_empresa, dados_certificado)
+    if fonte_escolhida == "omie":
+        nova_empresa.fonte_notas = "omie"
+    else:
+        _aplicar_certificado(nova_empresa, dados_certificado)
+        if concordancia_sefaz is True:
+            _registrar_concordancia_sefaz(nova_empresa, usuario)
     _aplicar_endereco_empresa(nova_empresa, info)
     db.add(nova_empresa)
     _salvar_empresa_no_banco(db, nova_empresa, "cadastrada")
@@ -1312,9 +1440,17 @@ async def cadastrar_empresa(
         f"(usuario_id={nova_empresa.usuario_id})",
         flush=True,
     )
+    mensagem = (
+        f"Empresa '{nova_empresa.nome_loja}' cadastrada e vinculada à sua conta!"
+    )
+    if fonte_escolhida == "omie":
+        mensagem += (
+            " Fonte das notas: Omie — grave o App Key/App Secret para sincronizar "
+            "os recebimentos."
+        )
     return {
         "sucesso": True,
-        "mensagem": f"Empresa '{nova_empresa.nome_loja}' cadastrada e vinculada à sua conta!",
+        "mensagem": mensagem,
         "empresa": _empresa_json(nova_empresa, 0),
         "adotada": False,
         "nome_atualizado": True,
@@ -1358,6 +1494,103 @@ def excluir_certificado_da_empresa(
             else "Esta loja já estava sem certificado cadastrado."
         ),
         "certificado_excluido": havia,
+        "empresa": _empresa_json(empresa, _total_notas(db, empresa.id)),
+    }
+
+
+class FonteNotasRequest(BaseModel):
+    """Corpo de ``POST /api/empresas/{empresa_id}/fonte-notas``.
+
+    ``fonte`` é ``"omie"`` (API de recebimentos) ou ``"certificado"`` (A1 +
+    Distribuição NF-e da SEFAZ). ``concordancia_sefaz`` é obrigatório para a fonte
+    certificado: é o aceite do aviso que evita baixar as mesmas notas em outro
+    sistema (conflito na distribuição da SEFAZ).
+    """
+
+    fonte: str
+    concordancia_sefaz: bool = False
+
+
+@app.post("/api/empresas/{empresa_id}/fonte-notas")
+def definir_fonte_notas_da_loja(
+    empresa_id: int,
+    dados: FonteNotasRequest,
+    usuario: Usuario = Depends(auth.usuario_atual),
+    db: Session = Depends(get_db),
+):
+    """Ativa a fonte das notas de UMA loja (seletor da tela "Minhas Lojas").
+
+    - ``omie``/``certificado``: o dono da loja ou o administrador pode trocar
+      (mesma regra de `_pode_gerenciar_loja`; loja de outra conta = 403).
+    - ``omie`` só ativa com a credencial já gravada na loja — sem ela a
+      sincronização responderia 400 e a tela pareceria "quebrada".
+    - ``certificado`` exige ``concordancia_sefaz=True``: o backend recusa (400)
+      sem o aceite e registra data/hora UTC + e-mail de quem confirmou.
+
+    A resposta devolve a loja no formato de `_empresa_json` (com a concordância),
+    para a tela atualizar cartão e seletor sem uma segunda chamada.
+    """
+    empresa = db.query(Empresa).filter(Empresa.id == empresa_id).first()
+    if not empresa:
+        raise HTTPException(status_code=404, detail="Loja não encontrada.")
+    if not _pode_gerenciar_loja(usuario, empresa):
+        raise HTTPException(
+            status_code=403,
+            detail="Esta loja não pertence à sua conta.",
+        )
+
+    fonte = str(dados.fonte or "").strip().lower()
+    if fonte not in ("omie", "certificado"):
+        raise HTTPException(
+            status_code=400,
+            detail="Fonte das notas inválida: use 'omie' ou 'certificado'.",
+        )
+
+    if fonte == "omie":
+        if not (
+            getattr(empresa, "omie_app_key", None)
+            and getattr(empresa, "omie_app_secret", None)
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Grave o App Key e o App Secret do Omie desta loja antes de "
+                    "ativar a fonte Omie."
+                ),
+            )
+        mensagem = (
+            f"Fonte das notas da loja '{empresa.nome_loja or empresa.cnpj}' "
+            "definida como Omie."
+        )
+    else:
+        if not dados.concordancia_sefaz:
+            raise HTTPException(
+                status_code=400, detail=certificados.ERRO_SEM_CONCORDANCIA
+            )
+        _registrar_concordancia_sefaz(empresa, usuario)
+        mensagem = (
+            f"Fonte das notas da loja '{empresa.nome_loja or empresa.cnpj}' "
+            "definida como certificado digital A1 (SEFAZ). Concordância registrada."
+        )
+        if not certificados.certificado_json(empresa):
+            mensagem += (
+                " Envie o certificado .pfx/.p12 no formulário 'Vincular novo CNPJ' "
+                "para ativar o download."
+            )
+
+    empresa.fonte_notas = fonte
+    db.commit()
+    db.refresh(empresa)
+    logger.info(
+        "Fonte das notas da loja %s definida como %s por %s.",
+        empresa.cnpj,
+        fonte,
+        usuario.email,
+    )
+    return {
+        "sucesso": True,
+        "mensagem": mensagem,
+        "fonte_notas": _fonte_notas_da_loja(empresa),
         "empresa": _empresa_json(empresa, _total_notas(db, empresa.id)),
     }
 
@@ -1822,6 +2055,13 @@ async def cadastrar_empresa_na_acbr(
     inscricao_estadual: str = Form(""),
     inscricao_municipal: str = Form(""),
     configurar_distribuicao: bool = Form(True),
+    concordancia_sefaz: Optional[bool] = Form(
+        None,
+        description=(
+            "Concordância com o aviso de que as notas não são baixadas em outro "
+            "sistema. A tela envia true; omitido = chamada legada."
+        ),
+    ),
 ):
     """Executa o cadastro ACBr exibindo no terminal o erro real de qualquer falha.
 
@@ -1852,6 +2092,7 @@ async def cadastrar_empresa_na_acbr(
             inscricao_estadual=inscricao_estadual,
             inscricao_municipal=inscricao_municipal,
             configurar_distribuicao=configurar_distribuicao,
+            concordancia_sefaz=concordancia_sefaz,
         )
     except HTTPException as erro:
         print(
@@ -1891,6 +2132,7 @@ async def _cadastrar_empresa_na_acbr_logica(
     inscricao_estadual: str,
     inscricao_municipal: str,
     configurar_distribuicao: bool,
+    concordancia_sefaz: Optional[bool] = None,
 ):
     """Cadastra/atualiza a empresa e o certificado digital na ACBr API.
 
@@ -1915,6 +2157,11 @@ async def _cadastrar_empresa_na_acbr_logica(
     cnpj_limpo = re.sub(r"\D", "", str(cnpj or ""))
     if len(cnpj_limpo) != 14:
         raise HTTPException(status_code=400, detail="Informe um CNPJ com 14 dígitos.")
+    if concordancia_sefaz is False:
+        # Mesmo aviso da tela: sem o aceite o certificado não é ativado.
+        raise HTTPException(
+            status_code=400, detail=certificados.ERRO_SEM_CONCORDANCIA
+        )
     # A loja criada nesta rota pertence SEMPRE à conta do token (nunca ao admin).
     dono_id = _id_do_usuario_logado(usuario)
     logger.info(
@@ -2124,6 +2371,8 @@ async def _cadastrar_empresa_na_acbr_logica(
         raise http from erro
 
     _aplicar_certificado(empresa, dados_certificado)
+    if concordancia_sefaz is True:
+        _registrar_concordancia_sefaz(empresa, usuario)
     _salvar_empresa_no_banco(db, empresa, "atualizada")
 
     # "Zero cliques": a resposta sai antes do download; a rotina usa uma sessão
@@ -2897,6 +3146,13 @@ def salvar_credenciais_omie(
         )
         raise HTTPException(status_code=500, detail=str(erro)) from erro
 
+    # Gravar a credencial = a loja passa a baixar as notas pelo Omie. A fonte
+    # fica explícita para o seletor da tela e para o cartão da loja; a troca de
+    # volta para o certificado é feita na rota /fonte-notas (com concordância).
+    empresa.fonte_notas = "omie"
+    db.commit()
+    db.refresh(empresa)
+
     logger.info(
         "Omie: credenciais da loja %s gravadas pelo usuário %s (app_key %s).",
         empresa.cnpj,
@@ -2908,6 +3164,7 @@ def salvar_credenciais_omie(
         "cnpj": empresa.cnpj,
         "loja": empresa.nome_loja or empresa.razao_social,
         "configurado": True,
+        "fonte_notas": _fonte_notas_da_loja(empresa),
         "app_key": cripto_credenciais.mascarar_segredo(app_key),
         "app_secret": cripto_credenciais.mascarar_segredo(app_secret),
         "mensagem": (
@@ -3035,6 +3292,7 @@ def status_omie(
     return {
         "cnpj": empresa.cnpj,
         "loja": empresa.nome_loja or empresa.razao_social,
+        "fonte_notas": _fonte_notas_da_loja(empresa),
         "omie_sync_em": empresa.omie_sync_em,
         "configurado": situacao["configurado"],
         "loja_configurada": situacao["loja_configurada"],

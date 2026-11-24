@@ -134,7 +134,7 @@ sistema_nfe_pro/
 ### Tabelas principais
 
 - `usuarios`: conta, hash de senha, `is_admin`, segredo/estado do 2FA.
-- `empresas`: CNPJ, nomes, `usuario_id` (dono), dados públicos do certificado, cursor `ultimo_nsu_acbr` e as credenciais Omie **cifradas** (`omie_app_key`/`omie_app_secret`) + `omie_sync_em` (última sincronização).
+- `empresas`: CNPJ, nomes, `usuario_id` (dono), dados públicos do certificado, fonte das notas (`fonte_notas` = `omie`/`certificado`), concordância SEFAZ (`cert_concordancia_em`/`cert_concordancia_por`), cursor `ultimo_nsu_acbr` e as credenciais Omie **cifradas** (`omie_app_key`/`omie_app_secret`) + `omie_sync_em` (última sincronização).
 - `fornecedores`, `notas_fiscais`, `itens_nota`: NF-e, itens crus e campos derivados (`cfop`, `marca`, `c_prod`, `unidade_compra`, `qtd_por_embalagem`, unidades/base).
 - `mapeamento_fornecedor_produtos`: memória de-para por CNPJ do fornecedor + `cProd`, com `origem` automática/manual.
 - `itens_auditados`: chave aprovada ou pendente (`auditado` + `motivo` manual/aberrante).
@@ -345,7 +345,14 @@ python testar_omie_sync.py --tudo --etapas 40,60,80 --sem-marcas
 - `GET /api/omie/status/{cnpj}` devolve `omie_sync_em`, as contagens da última sincronização real (resumo persistido em `configuracoes_sistema`, chave `omie_ultima_sync:<cnpj>`), se há credencial (loja/ambiente) e a chave mascarada — **nunca** o `app_secret`;
 - o agendador (`backend/agendador.py`) roda **diariamente** na hora `NFE_OMIE_HORA` (padrão 3), uma vez por loja com credencial gravada, com pausa entre lojas (`NFE_OMIE_PAUSA_SEGUNDOS`, padrão 2 s, por causa do HTTP 425). A loja já sincronizada no dia é pulada (`omie_sync_em` convertido para o fuso local) e a falha não repete a cada minuto. O HTTP 500 `ERROR: Não existem registros para a página [1]!` é tratado como **sem dados** (`OmieSemRegistros` → lista vazia), não como erro fatal.
 
-As três rotas usam a mesma checagem de dono das rotas ACBr (`_pode_gerenciar_loja`: admin vê todas). Erros: credencial ausente/ilegível e período inválido = 400; recusa da API do Omie = 502. A tela em **Minhas Lojas** é a parte 2 (ainda pendente). O XML da nota só aparece no Omie depois que ela chega em **Recebido** (`cEtapa` 60); etapas 40 trazem apenas cabeçalho + `itensRecebimento`, e o `cXml` chega HTML-escapado (`html.unescape` antes de usar).
+As três rotas usam a mesma checagem de dono das rotas ACBr (`_pode_gerenciar_loja`: admin vê todas). Erros: credencial ausente/ilegível e período inválido = 400; recusa da API do Omie = 502. O XML da nota só aparece no Omie depois que ela chega em **Recebido** (`cEtapa` 60); etapas 40 trazem apenas cabeçalho + `itensRecebimento`, e o `cXml` chega HTML-escapado (`html.unescape` antes de usar).
+
+**Fase 3a parte 2 — tela "Fonte das notas" (Minhas Lojas, 24/11/2026).** Cada loja escolhe **de onde** baixa as notas, com apenas uma fonte ativa:
+
+- **Omie:** painel com `app_key`/`app_secret` (formulário; segredo cifrado, nunca reexibido), status da última sincronização + contagens (`GET /api/omie/status/{cnpj}`) e botão **🔄 Sincronizar agora** com a opção **simular** marcada por padrão (testa sem gravar).
+- **Certificado digital A1 (baixar direto da SEFAZ):** mantém o upload `.pfx/.p12` já existente, agora com **aviso destacado** e **checkbox de concordância obrigatório** ("Confirmo que as notas fiscais desta empresa NÃO são baixadas em nenhum outro sistema..."). Sem o aceite o certificado não é salvo/ativado; a concordância fica gravada com data/hora UTC e e-mail da conta (`empresas.cert_concordancia_em`/`cert_concordancia_por`) e aparece no cartão e no painel.
+- A escolha fica em `empresas.fonte_notas` (`omie`/`certificado`; NULL nas lojas antigas é derivado do que a loja já tem). A rota nova `POST /api/empresas/{id}/fonte-notas` ativa a fonte, exige credencial para o Omie e a concordância para o certificado; `POST /api/empresas/cadastrar` aceita `fonte_notas="omie"` (vínculo **sem** certificado) e `concordancia_sefaz=true`. O seletor usa a mesma lista de lojas da tela: o admin vê/gerencia todas (com o e-mail do dono no rótulo) e a conta comum só as próprias.
+- O formulário "Vincular novo CNPJ" ganhou o seletor de fonte **fora** do `st.form` (troca upload x credenciais no mesmo run). No certificado, o submit valida o checkbox antes de chamar a API e envia a concordância; no Omie, o vínculo e a gravação da credencial acontecem no mesmo clique.
 
 ---
 
@@ -424,7 +431,8 @@ python tests/test_migracao_postgres.py
 - `tests/test_omie_sync.py`: **OK** — migração aditiva idempotente das colunas Omie, credenciais Fernet (cifra, lê de volta, origem loja/ambiente, erro de chave trocada), sincronização real contra `ClienteFalso` (mapeamento de chave/número/série/data/valor/fornecedor/EAN/NCM/CFOP, valores crus vs `*_base`, bonificação ignorada, cancelada não gravada, dedupe na segunda execução, `--simular` = rollback), tudo em SQLite temporário e sem rede.
 - `tests/test_omie_rotas.py`: **12/12** — credencial cifrada + máscara (sem segredo na resposta), 403/400/404, status com `omie_sync_em`/contagens e credencial ilegível, sincronização com janela padrão/datas/etapas/simulação e tradução de erros (400/502), agendamento diário (uma vez por loja, pausa, não repete no dia) e HTTP 500 "Não existem registros" = sem dados. `py_compile` de `backend/main.py`, `backend/agendador.py`, `backend/omie_client.py` e do teste: **OK**; `tests/test_acbr_rotas.py` continua passando (app sobe com os dois agendadores).
 - `tests/test_migracao_postgres.py`: **passou** (cópia com as colunas novas, IDs/contagens preservados).
-- `tests/test_multitenancy_lojas.py`: **9/9** (inclui as colunas novas de `empresas`).
+- `tests/test_multitenancy_lojas.py`: **14/14** (inclui as colunas novas de `empresas`, a fonte das notas Omie x certificado, a concordância obrigatória com data/usuário, o bloqueio de loja de outra conta e o cadastro com `fonte_notas="omie"` sem certificado).
+- Tela da fonte das notas validada por AppTest com a API mockada: painel Omie (status/contagens), troca para certificado (aviso + checkbox + botão desabilitado), POST `/fonte-notas` com `concordancia_sefaz=true`, cadastro de CNPJ novo sem aceite (nenhuma chamada) e com aceite (concordância nos dois POSTs), além do fluxo Omie (`cadastrar` com `fonte_notas=omie` + `credenciais`). Testes de integração afetados rodaram contra API temporária: **8/8** AppTests/barreira do certificado (inclui `test_apptest_alertas_e_botao_excluir_certificado`, `test_apptest_cadastro_loja_formulario_e_endereco_fiscal` e `test_cadastro_avisa_quando_receita_indisponivel`); `tests/test_acbr_rotas.py` continua passando.
 - `tests/test_marcas.py` e `tests/test_integridade_relatorios.py` agora chamam `init_db(engine)` na **cópia** do banco, então a cópia nasce com as migrações aditivas (antes a suíte quebrava em `no such column: empresas.omie_app_key`); a base real continua intocada. A suíte principal continua exigindo a API ligada.
 - `testar_omie_sync.py` validado por harness fora do repositório (base temporária): `--gravar-credenciais` cifra e relê, `--simular` não grava, execução real importa/deduplica, CNPJ inexistente sai com `1`, parsers de `--etapas`/data/`--dias` e `--help` OK.
 - Suíte principal: **74/74 testes passaram** (inclui os AppTests de Minhas Lojas/alertas, que exigem a API ligada).
@@ -472,7 +480,17 @@ Arquivos novos/alterados nesta frente: `backend/omie_client.py`, `backend/omie_s
 4. **HTTP 500 "Não existem registros"** (`backend/omie_client.py`): nova `OmieSemRegistros` + `sem_registros()`; `_chamar` classifica o erro e as quatro listagens (`recebimentos`/`documentos`, página e todas) devolvem `[]` em vez de exceção.
 5. **Testes**: `tests/test_omie_rotas.py` (12 testes, mock e SQLite temporário) cobrindo rotas, permissões, status sem segredo, agendador e classificação do 500.
 
-Arquivos novos/alterados nesta frente: `backend/main.py`, `backend/agendador.py`, `backend/omie_client.py`, `tests/test_omie_rotas.py` e este resumo. A tela em Minhas Lojas (parte 2) fica pendente.
+Arquivos novos/alterados nesta frente: `backend/main.py`, `backend/agendador.py`, `backend/omie_client.py`, `tests/test_omie_rotas.py` e este resumo. A tela em Minhas Lojas ficou para a parte 2 (abaixo).
+
+### Frente Omie — fase 3a parte 2: tela "Fonte das notas" (24/11/2026)
+
+1. **Seletor por loja (`frontend/app.py`)**: em **Minhas Lojas**, seção "⚙️ Fonte das notas por loja" com `selectbox` das lojas da conta (o admin vê todas, com o e-mail do dono) e `radio` **Omie** x **Certificado A1**. Cada painel mostra status e ações da fonte escolhida.
+2. **Painel Omie**: `app_key`/`app_secret` em formulário (segredo cifrado, nunca reexibido), status da última sincronização + contagens via `GET /api/omie/status/{cnpj}` e botão **🔄 Sincronizar agora** com **simular** ligado por padrão; o resumo (novas/duplicadas/itens/avisos) aparece na própria tela.
+3. **Painel Certificado**: aviso destacado de que a SEFAZ entrega cada nota a um único sistema, checkbox de concordância obrigatório, data da concordância já registrada (Brasília) e botão de ativação desabilitado até o aceite. O upload `.pfx/.p12` existente foi mantido no formulário "Vincular novo CNPJ".
+4. **Backend**: colunas aditivas `empresas.fonte_notas`, `cert_concordancia_em` e `cert_concordancia_por` (migração idempotente em `init_db`); rota `POST /api/empresas/{id}/fonte-notas` (exige credencial para Omie e concordância para certificado); `POST /api/empresas/cadastrar` aceita `fonte_notas="omie"` (vínculo sem `.pfx`) e grava a concordância quando `concordancia_sefaz=true`; `/api/acbr/empresas` também grava/recusa a concordância. Excluir o certificado apaga a concordância; gravar credencial Omie ativa a fonte Omie. `_empresa_json` devolve `fonte_notas`, `cert_concordancia`, `omie_sync_em` e `omie_configurado` (sem segredo).
+5. **Testes**: `tests/test_multitenancy_lojas.py` ganhou 5 casos (derivação da fonte e JSON sem segredo, concordância obrigatória + data/usuário, credencial Omie/403, exclusão limpando a concordância e cadastro com fonte Omie sem certificado); `tests/test_integridade_relatorios.py` marca o checkbox da concordância nos AppTests do cadastro. Fluxos de tela (painel Omie, troca para certificado, submit sem/com aceite e cadastro Omie) validados por AppTest temporário com a API mockada.
+
+Arquivos novos/alterados nesta frente: `frontend/app.py`, `backend/main.py`, `backend/models.py`, `backend/database.py`, `backend/certificados.py`, `tests/test_multitenancy_lojas.py`, `tests/test_omie_rotas.py`, `tests/test_integridade_relatorios.py` e este resumo.
 
 ---
 
@@ -554,7 +572,7 @@ Arquivos novos/alterados nesta frente: `backend/main.py`, `backend/agendador.py`
 ### Sprint 1.5 — Omie fase 3 (rotas + tela)
 
 - [x] `POST /api/omie/credenciais` (grava cifrado, devolve só os 4 últimos caracteres), `POST /api/omie/sincronizar` (dispara o sync da loja e devolve o resumo) e `GET /api/omie/status/{cnpj}` (`omie_sync_em`, origem da credencial, última execução).
-- [ ] Tela em **Minhas Lojas**: campos de `app_key`/`app_secret`, botão **🔄 Sincronizar Omie** com resumo (novas/duplicadas/itens/erros) e teste em `--simular` antes de gravar.
+- [x] Tela em **Minhas Lojas**: seletor de **fonte das notas** (Omie x certificado A1) por loja, campos de `app_key`/`app_secret`, status da última sync + contagens, botão **🔄 Sincronizar agora** com resumo e simulação padrão, aviso + **concordância obrigatória** do certificado (data/hora + usuário) e cadastro de CNPJ novo já escolhendo a fonte.
 - [x] Definir agendamento (mesma lógica do NSU da ACBr) e recorte padrão (dias/etapas) por loja — diário às `NFE_OMIE_HORA` (padrão 3), 30 dias/etapas 40/60/80, pausa entre lojas.
 
 ### Sprint 2 — alertas reais

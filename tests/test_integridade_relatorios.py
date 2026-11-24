@@ -3185,6 +3185,8 @@ def test_apptest_alertas_e_botao_excluir_certificado():
         uploader = uploader_certificado()
         chave_uploader_antes = uploader.key
         uploader.upload("certificado-teste.pfx", b"conteudo", "application/x-pkcs12")
+        # A concordância da SEFAZ é obrigatória para salvar o certificado.
+        app.checkbox(key="nova_loja_concordancia_sefaz").check()
         confirmacao_habilitada = next(
             campo
             for campo in confirmacoes
@@ -3417,6 +3419,8 @@ def test_apptest_cadastro_loja_formulario_e_endereco_fiscal():
             if str(campo.key).startswith("uploader_certificado_")
         )
         uploader.upload("certificado-teste.pfx", b"conteudo", "application/x-pkcs12")
+        # Sem marcar a concordância o submit da tela não chama a API.
+        app.checkbox(key="nova_loja_concordancia_sefaz").check()
         app.text_input(key="nova_loja_cep").set_value("06708-415")
         app.text_input(key="nova_loja_logradouro").set_value("RUA JOSE FELIX DE OLIVEIRA")
         app.text_input(key="nova_loja_numero").set_value("991")

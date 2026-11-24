@@ -232,6 +232,10 @@ def _garantir_colunas_novas(conexao):
       administrador confirma um código de 6 dígitos;
     - empresas.certificado_*: dados públicos do certificado digital A1 informado no
       vínculo da loja (titular, validade e data do envio);
+    - empresas.fonte_notas / cert_concordancia_em / cert_concordancia_por: fonte das
+      notas da loja ("omie" ou "certificado") e a concordância com o aviso de que as
+      notas NÃO são baixadas em outro sistema (data/hora UTC + e-mail de quem
+      confirmou). Nascem NULL: a leitura deriva a fonte do que a loja já tem;
     - empresas.ultimo_nsu_acbr: último NSU consumido na Distribuição NF-e da ACBr.
       "0" (ou NULL) marca a primeira consulta (DIAS_PRIMEIRO_DOWNLOAD, padrão 7);
     - empresas.omie_app_key / omie_app_secret / omie_sync_em: integração com a API
@@ -319,6 +323,14 @@ def _garantir_colunas_novas(conexao):
         executar("ALTER TABLE usuarios ADD COLUMN totp_ativo " + _booleano(conexao))
 
     for coluna in ("certificado_titular", "certificado_validade", "certificado_enviado_em"):
+        if coluna not in _colunas(conexao, "empresas"):
+            executar(f"ALTER TABLE empresas ADD COLUMN {coluna} TEXT")
+
+    # ── Fonte das notas + concordância SEFAZ (fase 3a do frontend) ─────────────
+    # A fonte escolhida na tela fica gravada por loja; a concordância registra
+    # data/hora e o e-mail de quem marcou o aviso do certificado. Tudo TEXT e
+    # NULL nas lojas antigas (a leitura deriva a fonte sem migrar dados).
+    for coluna in ("fonte_notas", "cert_concordancia_em", "cert_concordancia_por"):
         if coluna not in _colunas(conexao, "empresas"):
             executar(f"ALTER TABLE empresas ADD COLUMN {coluna} TEXT")
 

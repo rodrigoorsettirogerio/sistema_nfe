@@ -92,6 +92,17 @@ class Empresa(Base):
     certificado_titular = Column(String)
     certificado_validade = Column(String)  # "DD/MM/AAAA"
     certificado_enviado_em = Column(String)  # ISO 8601 do último envio
+    # Fonte das notas da loja: "omie" (API de recebimentos) ou "certificado"
+    # (A1 + Distribuição NF-e da ACBr/SEFAZ). NULL nas lojas antigas; a leitura
+    # (`main._fonte_notas_da_loja`) deriva do que a loja tem configurado para a
+    # tela nunca ficar sem valor.
+    fonte_notas = Column(String)
+    # Concordância explícita do cliente com o download direto na SEFAZ. Fica
+    # registrada com data/hora (ISO 8601 UTC) e o e-mail de quem confirmou: é a
+    # prova de que as notas não são baixadas em outro sistema (evita conflito na
+    # distribuição). Apagada junto com o certificado.
+    cert_concordancia_em = Column(String)
+    cert_concordancia_por = Column(String)
     # Último NSU já consumido na Distribuição NF-e da ACBr. "0" (ou NULL) significa
     # que a loja nunca baixou nada; o primeiro download usa 7 dias por padrão.
     ultimo_nsu_acbr = Column(String, nullable=True, default="0")
