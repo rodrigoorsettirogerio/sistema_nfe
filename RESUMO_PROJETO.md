@@ -318,7 +318,7 @@ Regras de negócio aplicadas:
 - **Dedupe por chave**: a mesma nota vista em etapas diferentes (40/60/80) ou já existente no banco conta como `duplicadas` e não cria linha nova; o cabeçalho é commitado antes dos itens (uma falha de item não faz a nota “desaparecer” da próxima execução).
 - **Bonificação/doação/brinde** (CFOP 5910/6910, preço 0, desconto integral ou termo BONIFIC/BRINDE/DOACAO na descrição) não entra em preço: vai para `bonificados`; nota só com bonificação é mantida (dedupe) e contada em `notas_sem_itens`.
 - **De-para**: usa `mapeamento_fornecedor_produtos` (CNPJ do fornecedor + `cProd`) carregado uma vez por execução, aplica `aplicar_identidade`/`aplicar_embalagem_aprendida` e registra o aprendizado dos itens novos.
-- **Marcas**: depois da importação chama `recalcular_marcas(db, apenas_cache=True)` (nenhuma chamada de IA), controlado por `recalcular_marcas_itens`.
+- **Marcas**: depois da importação chama `recalcular_marcas(db, apenas_cache=True)` (nenhuma chamada de IA), controlado por `recalcular_marcas_itens`; no fim o resumo traz `itens_sem_marca` e, quando > 0, um `aviso` mandando rodar `backfill_marcas.py` (marca `NULL` abre linha duplicada “(2)” no relatório, porque a marca entra na chave do grupo).
 - **`omie_sync_em`**: gravado em ISO 8601 UTC ao fim de uma execução real.
 - **Simulação (`confirmar=False`)**: faz `flush` a cada nota (validando constraints) e `rollback()` no fim — nenhuma linha permanece no banco.
 
@@ -331,12 +331,15 @@ python testar_omie_sync.py --gravar-credenciais --cnpj 12345678000199
 # valida tudo sem gravar (rollback no fim; nada de rede além da API do Omie)
 python testar_omie_sync.py --simular --dias 7
 
-# importa de fato (padrão: hoje - 30 dias, etapas 40/60/80)
+# importa de fato (padrão: hoje - 30 dias, etapas 40/60/80) — sempre recalcula marcas
 python testar_omie_sync.py
-python testar_omie_sync.py --tudo --etapas 40,60,80 --sem-marcas
+python testar_omie_sync.py --tudo --etapas 40,60,80
+
+# --sem-marcas só existe na simulação (importação real sem marca quebra o agrupamento)
+python testar_omie_sync.py --simular --sem-marcas
 ```
 
-`--cnpj` escolhe a loja (sem ele, só roda se houver **uma** loja cadastrada; com várias, lista as opções e falha), `--data-inicio`/`--data-fim` (dd/mm/aaaa) substituem `--dias` e `--tudo` importa o histórico inteiro. Códigos de saída: `0` sucesso, `1` falha de configuração/credencial/loja, `2` concluiu com erros por nota/etapa (nestes casos `--simular` também sai com `2` e avisa que a simulação teve erros).
+`--cnpj` escolhe a loja (sem ele, só roda se houver **uma** loja cadastrada; com várias, lista as opções e falha), `--data-inicio`/`--data-fim` (dd/mm/aaaa) substituem `--dias` e `--tudo` importa o histórico inteiro. `--sem-marcas` sem `--simular` é recusado (uso inválido: nada é gravado). Códigos de saída: `0` sucesso, `1` falha de configuração/credencial/loja, `2` concluiu com erros por nota/etapa ou uso inválido de `--sem-marcas` (nestes casos `--simular` também sai com `2` e avisa que a simulação teve erros).
 
 **Fase 3a — API e agendamento (24/11/2026).** O Omie agora é operado pela API, não só por script:
 
@@ -467,7 +470,7 @@ Arquivos alterados nesta frente: `backend/consulta_cadastral.py` (novo), `backen
 1. **Cliente HTTP** (`backend/omie_client.py`): `ListarRecebimentos` (detalhado, filtro por emissão e etapa) e `ListarDocumentos` (XML completo de entrada), com erro em dois níveis e pausa entre páginas por causa do HTTP 425.
 2. **Credenciais cifradas por loja** (`backend/cripto_credenciais.py` + colunas em `empresas`): Fernet/PBKDF2, prefixo `fernet:v1:`, migração aditiva idempotente em `init_db`, fallback para o `.env` e erro claro quando a chave de criptografia muda.
 3. **Sincronização** (`backend/omie_sync.py`): recebimentos do Omie → `fornecedores`/`notas_fiscais`/`itens_nota`, com dedupe por chave, descarte de canceladas e bonificações, de-para por fornecedor+`cProd`, valores crus + `*_base`, `omie_sync_em`, modo simulação e recálculo de marcas só por cache.
-4. **Scripts**: `testar_omie.py` (cliente, sem banco), `testar_omie_sync.py` (`--simular`, `--gravar-credenciais`, `--cnpj`, `--dias`/`--data-inicio`/`--data-fim`/`--tudo`, `--etapas`, `--sem-marcas`) e os diagnósticos `diagnostico_omie_cetapa.py`/`diagnostico_omie_xml.py`.
+4. **Scripts**: `testar_omie.py` (cliente, sem banco), `testar_omie_sync.py` (`--simular`, `--gravar-credenciais`, `--cnpj`, `--dias`/`--data-inicio`/`--data-fim`/`--tudo`, `--etapas`, `--sem-marcas` só junto de `--simular`) e os diagnósticos `diagnostico_omie_cetapa.py`/`diagnostico_omie_xml.py`.
 5. **Testes**: `tests/test_omie_sync.py` (offline, cliente falso) e `init_db(engine)` na cópia usada por `test_marcas.py`/`test_integridade_relatorios.py`.
 
 Arquivos novos/alterados nesta frente: `backend/omie_client.py`, `backend/omie_sync.py`, `backend/cripto_credenciais.py`, `backend/models.py`, `backend/database.py`, `testar_omie.py`, `testar_omie_sync.py`, `tests/test_omie_sync.py`, `tests/test_marcas.py`, `tests/test_integridade_relatorios.py` e este resumo.

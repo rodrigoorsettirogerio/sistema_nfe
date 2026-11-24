@@ -413,6 +413,26 @@ def _commit(db, confirmar: bool) -> None:
         db.flush()
 
 
+def _contar_itens_sem_marca(db, notas_ids: Iterable[int]) -> int:
+    """Itens das notas importadas nesta execução que ficaram com ``marca`` NULL.
+
+    A marca entra na chave do grupo dos relatórios (Produto + Marca): o mesmo
+    produto com marca e sem marca vira duas linhas ("... (2)"). O importador de
+    XML sempre recalcula as marcas no fim; aqui a contagem alimenta um AVISO no
+    resumo da sincronização (e o ``backfill_marcas.py`` corrige a base) em vez de
+    esconder o problema. Notas antigas não entram na conta — só as desta execução.
+    """
+    ids = [identificador for identificador in notas_ids if identificador is not None]
+    if not ids:
+        return 0
+    try:
+        return db.query(ItemNota.id).filter(
+            ItemNota.nota_id.in_(ids), ItemNota.marca.is_(None)
+        ).count()
+    except Exception:  # noqa: BLE001 - a contagem é acessório do resumo
+        return 0
+
+
 def _fornecedor_da_nota(
     db, cnpj: str, nome: str, cache: Dict[str, Fornecedor], resultado: Dict[str, Any]
 ) -> Optional[Fornecedor]:
@@ -454,6 +474,7 @@ def _importar_recebimento(
     fornecedores: Dict[str, Fornecedor],
     mapa_aprendizado: Dict[Tuple[str, str], Any],
     confirmar: bool,
+    notas_novas: List[int],
 ) -> str:
     """Grava UM recebimento (cabeçalho + itens) e devolve o contador afetado.
 
@@ -462,6 +483,9 @@ def _importar_recebimento(
     dados (data inválida, falha de gravação) sobe como exceção para o laço, que
     desfaz a transação daquela nota e continua nas seguintes — a importação de
     1.800 notas não pode parar por causa de uma.
+
+    ``notas_novas`` recebe o id de cada nota criada nesta execução; é o recorte
+    usado no fim para contar os itens que ficaram sem marca.
     """
     dados = _dados_do_recebimento(recebimento)
 
@@ -509,6 +533,8 @@ def _importar_recebimento(
     # Commita já o cabeçalho (como no import_xmls): a nota existe no Omie mesmo
     # que um item isolado falhe, então ela não pode "sumir" numa nova tentativa.
     _commit(db, confirmar)
+    if getattr(nota, "id", None) is not None:
+        notas_novas.append(nota.id)
 
     itens_gravados = 0
     for bruto in dados["itens"]:
@@ -651,8 +677,10 @@ def sincronizar_recebimentos(
         ``canceladas``, ``ignoradas``, ``itens``, ``bonificados``,
         ``notas_sem_itens``, ``fornecedores_novos``, ``fornecedores_atualizados``,
         ``mapeamentos_criados``, ``mapeamentos_usados``, ``etapas`` (total por
-        etapa), ``notas_novas`` (amostra), ``erros`` (lista legível),
-        ``periodo``, ``origem_credenciais`` e ``simulado``.
+        etapa), ``notas_novas`` (amostra), ``itens_sem_marca`` (itens das notas
+        importadas que ficaram sem marca), ``avisos`` (lista legível de avisos,
+        ex.: itens sem marca), ``erros`` (lista legível), ``periodo``,
+        ``origem_credenciais`` e ``simulado``.
 
     Raises:
         ErroSincronizacao: empresa/período/etapa inválidos.
@@ -704,6 +732,8 @@ def sincronizar_recebimentos(
         "mapeamentos_criados": 0,
         "mapeamentos_usados": 0,
         "notas_novas": [],
+        "itens_sem_marca": 0,
+        "avisos": [],
         "erros": [],
         "origem_credenciais": origem_credenciais,
         "simulado": not confirmar,
@@ -712,6 +742,8 @@ def sincronizar_recebimentos(
 
     vistas: Set[str] = set()
     fornecedores: Dict[str, Fornecedor] = {}
+    # Ids das notas criadas nesta execução (recorte do aviso de "item sem marca").
+    notas_novas: List[int] = []
     # Memória de-para carregada uma vez para a execução inteira, como no import_xmls.
     mapa_aprendizado = {
         (m.cnpj_fornecedor, m.c_prod): m
@@ -756,6 +788,7 @@ def sincronizar_recebimentos(
                     fornecedores,
                     mapa_aprendizado,
                     confirmar,
+                    notas_novas,
                 )
             except Exception as exc:  # noqa: BLE001 - uma nota não derruba a importação
                 db.rollback()
@@ -776,6 +809,17 @@ def sincronizar_recebimentos(
                 resultado["marcas"] = recalcular_marcas(db, apenas_cache=True)
             except Exception as exc:  # noqa: BLE001 - marca é acessório do relatório
                 resultado["erros"].append(f"marcas: {exc}")
+        # A marca entra na chave do grupo dos relatórios: se sobrou item sem marca,
+        # o mesmo produto aparece em duas linhas ("... (2)"). Avisa sem marcar a
+        # sincronização como falha (o import em si deu certo) — a correção é o
+        # backfill_marcas.py, que usa a memória de marcas antes da heurística.
+        resultado["itens_sem_marca"] = _contar_itens_sem_marca(db, notas_novas)
+        if resultado["itens_sem_marca"]:
+            resultado["avisos"].append(
+                f"{resultado['itens_sem_marca']} item(ns) importado(s) sem marca — "
+                'rode "python backfill_marcas.py" (a marca entra na chave do grupo '
+                "nos relatórios e o item sem marca abre linha duplicada)."
+            )
         if atualizar_sync_em and getattr(empresa, "id", None):
             empresa.omie_sync_em = datetime.now(timezone.utc).isoformat(
                 timespec="seconds"

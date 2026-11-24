@@ -17,6 +17,12 @@ lista as opções e pede o argumento.
 ``--simular`` executa a importação inteira e desfaz no fim (rollback): serve
 para conferir o volume (novas/duplicadas/itens) antes de gravar de verdade.
 
+``--sem-marcas`` só é aceito junto de ``--simular``: a importação real SEMPRE
+recalcula ``itens_nota.marca`` no fim. A marca entra na chave do grupo dos
+relatórios (Produto + Marca), então um lote gravado sem marca abre linha
+duplicada ("BATATA ... (2)") no preço do mesmo produto. Usado sem ``--simular``
+o script encerra com erro (código de saída 2) e não grava nada.
+
 ``--gravar-credenciais`` cifra o par App Key/App Secret da loja nas colunas
 ``empresas.omie_app_key``/``omie_app_secret`` (a chave de criptografia vem de
 ``OMIE_ENC_KEY``/``NFE_SECRET_KEY``/``.secret_key`` e nunca vai para o banco) e
@@ -84,6 +90,25 @@ def _etapas_argumento(texto: str) -> tuple:
     if not etapas:
         raise argparse.ArgumentTypeError("informe ao menos uma etapa (40, 60, 80)")
     return tuple(etapas)
+
+
+def _erro_sem_marcas(args) -> str:
+    """Mensagem de erro quando ``--sem-marcas`` é usado fora da simulação.
+
+    ``--sem-marcas`` desliga ``recalcular_marcas_itens`` e deixa os itens novos
+    com ``itens_nota.marca = NULL``. Como a marca entra na chave do grupo dos
+    relatórios, o mesmo produto passa a aparecer em duas linhas ("... (2)").
+    Na simulação nada é gravado (rollback no fim), então lá o atalho é inofensivo.
+    Devolve ``""`` quando a combinação é válida.
+    """
+    if getattr(args, "sem_marcas", False) and not getattr(args, "simular", False):
+        return (
+            "--sem-marcas só é permitido junto de --simular: a importação real "
+            "sempre recalcula itens_nota.marca (a marca entra na chave do grupo "
+            "nos relatórios e o item sem marca abre linha duplicada). Rode de "
+            "novo sem --sem-marcas para importar."
+        )
+    return ""
 
 
 def _nome_da_empresa(empresa) -> str:
@@ -167,6 +192,12 @@ def _imprimir_resultado(resultado: dict) -> None:
             "🏷️  Marcas recalculadas (cache local): "
             f"{marcas.get('com_marca', 0)} item(ns) com marca"
         )
+
+    avisos = resultado.get("avisos") or []
+    if avisos:
+        print(f"⚠️  {len(avisos)} aviso(s):")
+        for aviso in avisos:
+            print(f"   - {aviso}")
 
     erros = resultado.get("erros") or []
     if erros:
@@ -275,9 +306,17 @@ def main(argv=None) -> int:
     parser.add_argument(
         "--sem-marcas",
         action="store_true",
-        help="Não recalcula itens_nota.marca depois de importar (importação mais rápida).",
+        help=(
+            "Só junto de --simular: não recalcula itens_nota.marca na simulação. "
+            "A importação real sempre recalcula."
+        ),
     )
     args = parser.parse_args(argv)
+
+    erro_sem_marcas = _erro_sem_marcas(args)
+    if erro_sem_marcas:
+        print(f"❌ FALHOU: {erro_sem_marcas}")
+        return 2
 
     try:
         if args.tudo:

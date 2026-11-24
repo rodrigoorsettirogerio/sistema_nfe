@@ -13,7 +13,10 @@ Prova, SEM chamar a API e SEM tocar na base real (banco SQLite temporário):
 5. a deduplicação por chave de acesso funciona (mesma nota em duas etapas e
    repetida na paginação = uma única linha);
 6. bonificação/doação e nota cancelada não entram na base;
-7. o modo ``--simular`` (``confirmar=False``) conta tudo e não deixa nada gravado.
+7. o modo ``--simular`` (``confirmar=False``) conta tudo e não deixa nada gravado;
+8. o resumo avisa quando um item importado ficou sem marca (a marca entra na
+   chave do grupo dos relatórios) e o CLI ``testar_omie_sync.py`` recusa
+   ``--sem-marcas`` fora da simulação.
 
 Uso (na raiz do projeto):
     python tests/test_omie_sync.py
@@ -333,6 +336,15 @@ def main():
                 "fornecedor criado uma vez (CNPJ único) e 2 produtos aprendidos",
             )
             _conferir(resultado["erros"] == [], "nenhum erro na sincronização")
+            _conferir(
+                resultado["itens_sem_marca"] == 2,
+                "os 2 itens importados ficaram sem marca (base sem memória de marcas)",
+            )
+            _conferir(
+                len(resultado["avisos"]) == 1
+                and "backfill_marcas.py" in resultado["avisos"][0],
+                "o resumo avisa os itens sem marca e indica o backfill_marcas.py",
+            )
 
 
             nota = db.query(NotaFiscal).filter(NotaFiscal.chave_acesso == CHAVE).one()
@@ -418,6 +430,10 @@ def main():
                 and db.query(ItemNota).count() == itens_antes,
                 "contagem de notas e itens não mudou na segunda execução",
             )
+            _conferir(
+                segunda["itens_sem_marca"] == 0 and segunda["avisos"] == [],
+                "sem nota nova não há aviso de item sem marca (recorte da execução)",
+            )
 
             print()
             print("=" * 78)
@@ -442,6 +458,50 @@ def main():
                 db.query(NotaFiscal).count() == notas_antes
                 and db.query(ItemNota).count() == itens_antes,
                 "a simulação não deixou nota/item gravado no banco",
+            )
+
+            print()
+            print("=" * 78)
+            print("6) CLI — --sem-marcas só é aceito junto de --simular")
+            print("=" * 78)
+            # Import tardio: o módulo do CLI lê o .env no import (load_dotenv sem
+            # override), então ele só entra aqui, depois do ambiente de teste.
+            import io
+            from contextlib import redirect_stdout
+            from types import SimpleNamespace
+
+            import testar_omie_sync as cli_omie
+
+            _conferir(
+                cli_omie._erro_sem_marcas(
+                    SimpleNamespace(sem_marcas=True, simular=False)
+                ).startswith("--sem-marcas só é permitido junto de --simular"),
+                "a validação recusa --sem-marcas sem --simular",
+            )
+            _conferir(
+                cli_omie._erro_sem_marcas(
+                    SimpleNamespace(sem_marcas=True, simular=True)
+                )
+                == "",
+                "--sem-marcas continua válido junto de --simular",
+            )
+            _conferir(
+                cli_omie._erro_sem_marcas(
+                    SimpleNamespace(sem_marcas=False, simular=False)
+                )
+                == "",
+                "a importação real (sem o flag) continua válida",
+            )
+
+            # O main() para ANTES de abrir o banco: nada é gravado nem consultado.
+            saida = io.StringIO()
+            with redirect_stdout(saida):
+                codigo = cli_omie.main(["--sem-marcas", "--dias", "7"])
+            texto = saida.getvalue()
+            _conferir(
+                codigo != 0 and "sempre recalcula" in texto,
+                f"o CLI encerra com código {codigo} e explica que a importação "
+                "real sempre recalcula marcas",
             )
 
             print()
