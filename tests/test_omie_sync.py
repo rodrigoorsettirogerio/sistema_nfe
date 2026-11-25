@@ -16,7 +16,12 @@ Prova, SEM chamar a API e SEM tocar na base real (banco SQLite temporário):
 7. o modo ``--simular`` (``confirmar=False``) conta tudo e não deixa nada gravado;
 8. o resumo avisa quando um item importado ficou sem marca (a marca entra na
    chave do grupo dos relatórios) e o CLI ``testar_omie_sync.py`` recusa
-   ``--sem-marcas`` fora da simulação.
+   ``--sem-marcas`` fora da simulação;
+9. a sinalização de divergência de produto grava pendência em ``itens_auditados``
+   (motivos ``divergencia_produto``/``revisar_vinculacao``) sem alterar a
+   identidade do item: mesma âncora (EAN ou fornecedor+cProd) com descrição/
+   cProd diferente é marcada, código ``PRD...`` pede revisão de vinculação e o
+   resumo ``divergencias`` conta notas/itens.
 
 Uso (na raiz do projeto):
     python tests/test_omie_sync.py
@@ -39,6 +44,7 @@ from backend import cripto_credenciais as bcripto
 from backend import omie_sync as bsync
 from backend.models import (
     Empresa,
+    ItemAuditado,
     ItemNota,
     MapeamentoFornecedorProduto,
     NotaFiscal,
@@ -48,6 +54,13 @@ CHAVE = "31261104559938000105550010000958901593724620"
 CHAVE_2 = "35261111222333000181550010000012341000012345"
 CHAVE_CANCELADA = "43261199888777000166550010000055551000055555"
 CHAVE_SIMULADA = "51261144555666000177550010000099991000099999"
+# Notas do bloco de divergências: EAN com outra descrição/cProd, cProd sem EAN
+# repetido com outra descrição e uma nota sem nenhum conflito.
+CHAVE_DIV_EAN = "44261107876067000567550010000011111000011111"
+CHAVE_PROD_NOVO = "45261107876067000567550010000022222000022222"
+CHAVE_PROD_DIVERGENTE = "46261107876067000567550010000033333000033333"
+CHAVE_LIMPA = "47261107876067000567550010000044444000044444"
+CHAVE_LIMPA_2 = "48261107876067000567550010000055555000055555"
 CNPJ = "04.559.938/0001-05"
 CNPJ_DIGITOS = "04559938000105"
 CHAVE_CRIPTO = "segredo-de-teste-omie-0123456789abcdef"
@@ -462,7 +475,222 @@ def main():
 
             print()
             print("=" * 78)
-            print("6) CLI — --sem-marcas só é aceito junto de --simular")
+            print("6) DIVERGÊNCIAS — sinaliza âncora/código PRD sem mudar a identidade")
+            print("=" * 78)
+            # A primeira importação só tinha códigos PRD (regra b): dois itens,
+            # dois marcadores VINC_..., sem conflito de descrição (histórico vazio).
+            _conferir(
+                resultado["divergencias"]["total"] == 2
+                and resultado["divergencias"]["revisar_vinculacao"] == 2
+                and resultado["divergencias"]["divergencia_produto"] == 0,
+                "importação inicial: 2 itens PRD sinalizados para revisar vinculação",
+            )
+            marcadores_prd = (
+                db.query(ItemAuditado)
+                .filter(ItemAuditado.motivo == bsync.MOTIVO_REVISAR_VINCULACAO)
+                .all()
+            )
+            _conferir(
+                len(marcadores_prd) == 2
+                and all(
+                    marcador.chave_identificacao.startswith("VINC_")
+                    and marcador.auditado is False
+                    for marcador in marcadores_prd
+                ),
+                "pendências VINC_ gravadas em itens_auditados (auditado=False)",
+            )
+
+            # Mesmo EAN já conhecido, mas com outra descrição e outro cProd do
+            # mesmo fornecedor: divergência + revisão de vinculação no mesmo item.
+            ean_divergente = bsync.sincronizar_recebimentos(
+                db,
+                empresa,
+                dias=7,
+                cliente=ClienteFalso(
+                    {
+                        "40": [
+                            _recebimento(
+                                chave=CHAVE_DIV_EAN,
+                                numero="000001111",
+                                valor=50.0,
+                                itens=[
+                                    _item(
+                                        codigo="PRD00077",
+                                        descricao="BACON FATIADO OUTRA MARCA",
+                                        ean="7898925798101",
+                                        quantidade=1.0,
+                                        preco=50.0,
+                                        total=50.0,
+                                    )
+                                ],
+                            )
+                        ]
+                    }
+                ),
+                intervalo=0.0,
+            )
+            _conferir(
+                ean_divergente["divergencias"]["total"] == 1
+                and ean_divergente["divergencias"]["divergencia_produto"] == 1
+                and ean_divergente["divergencias"]["revisar_vinculacao"] == 1
+                and ean_divergente["divergencias"]["notas"] == 1,
+                "mesmo EAN com outra descrição/cProd: divergência + PRD no mesmo item",
+            )
+            nota_div = (
+                db.query(NotaFiscal)
+                .filter(NotaFiscal.chave_acesso == CHAVE_DIV_EAN)
+                .one()
+            )
+            item_div = db.query(ItemNota).filter(ItemNota.nota_id == nota_div.id).one()
+            _conferir(
+                item_div.descricao_produto == "BACON FATIADO OUTRA MARCA"
+                and item_div.c_prod == "PRD00077"
+                and item_div.ean == "7898925798101",
+                "a identidade gravada continua a do Omie (a divergência só sinaliza)",
+            )
+
+            # Sem EAN a âncora é fornecedor + cProd: a primeira nota aprende o
+            # produto e a segunda, com a MESMA chave e outra descrição, diverge.
+            produto_novo = bsync.sincronizar_recebimentos(
+                db,
+                empresa,
+                dias=7,
+                cliente=ClienteFalso(
+                    {
+                        "40": [
+                            _recebimento(
+                                chave=CHAVE_PROD_NOVO,
+                                numero="000002222",
+                                valor=50.0,
+                                itens=[
+                                    _item(
+                                        codigo="FORN001",
+                                        descricao="FARINHA DE TRIGO",
+                                        ean="",
+                                        ncm="1101.00.10",
+                                        quantidade=10.0,
+                                        preco=5.0,
+                                        total=50.0,
+                                    )
+                                ],
+                            )
+                        ]
+                    }
+                ),
+                intervalo=0.0,
+            )
+            _conferir(
+                produto_novo["divergencias"]["total"] == 0,
+                "primeira nota de um cProd (sem EAN) não é divergência",
+            )
+            produto_divergente = bsync.sincronizar_recebimentos(
+                db,
+                empresa,
+                dias=7,
+                cliente=ClienteFalso(
+                    {
+                        "40": [
+                            _recebimento(
+                                chave=CHAVE_PROD_DIVERGENTE,
+                                numero="000003333",
+                                valor=60.0,
+                                itens=[
+                                    _item(
+                                        codigo="FORN001",
+                                        descricao="FARINHA DE TRIGO INTEGRAL",
+                                        ean="",
+                                        ncm="1101.00.10",
+                                        quantidade=10.0,
+                                        preco=6.0,
+                                        total=60.0,
+                                    )
+                                ],
+                            )
+                        ]
+                    }
+                ),
+                intervalo=0.0,
+            )
+            _conferir(
+                produto_divergente["divergencias"]["total"] == 1
+                and produto_divergente["divergencias"]["divergencia_produto"] == 1
+                and produto_divergente["divergencias"]["revisar_vinculacao"] == 0
+                and produto_divergente["divergencias"]["notas"] == 1,
+                "mesmo fornecedor+cProd com outra descrição: divergência de produto",
+            )
+
+            # Descrição igual na mesma âncora (duas notas seguidas): nada a sinalizar.
+            for chave, numero in (
+                (CHAVE_LIMPA, "000004444"),
+                (CHAVE_LIMPA_2, "000005555"),
+            ):
+                limpa = bsync.sincronizar_recebimentos(
+                    db,
+                    empresa,
+                    dias=7,
+                    cliente=ClienteFalso(
+                        {
+                            "40": [
+                                _recebimento(
+                                    chave=chave,
+                                    numero=numero,
+                                    valor=40.0,
+                                    itens=[
+                                        _item(
+                                            codigo="FORN002",
+                                            descricao="ACUCAR REFINADO",
+                                            ean="",
+                                            ncm="1701.99.00",
+                                            quantidade=10.0,
+                                            preco=4.0,
+                                            total=40.0,
+                                        )
+                                    ],
+                                )
+                            ]
+                        }
+                    ),
+                    intervalo=0.0,
+                )
+                _conferir(
+                    limpa["divergencias"]["total"] == 0,
+                    f"descrição igual na mesma âncora não gera divergência ({chave[-6:]})",
+                )
+
+            marcadores = (
+                db.query(ItemAuditado)
+                .filter(
+                    ItemAuditado.motivo.in_(
+                        [
+                            bsync.MOTIVO_DIVERGENCIA_PRODUTO,
+                            bsync.MOTIVO_REVISAR_VINCULACAO,
+                        ]
+                    )
+                )
+                .all()
+            )
+            por_motivo = {}
+            for marcador in marcadores:
+                por_motivo[marcador.motivo] = por_motivo.get(marcador.motivo, 0) + 1
+            _conferir(
+                por_motivo.get(bsync.MOTIVO_DIVERGENCIA_PRODUTO) == 2
+                and por_motivo.get(bsync.MOTIVO_REVISAR_VINCULACAO) == 3,
+                f"pendências acumuladas por motivo: {por_motivo}",
+            )
+            _conferir(
+                all(
+                    marcador.chave_identificacao.startswith(("DIV_", "VINC_"))
+                    and not marcador.chave_identificacao.startswith("DESC_")
+                    for marcador in marcadores
+                ),
+                "chaves DIV_/VINC_ ficam fora do mapa DESC_ usado pelos relatórios",
+            )
+
+
+
+            print()
+            print("=" * 78)
+            print("7) CLI — --sem-marcas só é aceito junto de --simular")
             print("=" * 78)
             # Import tardio: o módulo do CLI lê o .env no import (load_dotenv sem
             # override), então ele só entra aqui, depois do ambiente de teste.

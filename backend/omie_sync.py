@@ -45,6 +45,16 @@ para que as duas origens produzam as MESMAS linhas:
   no XML, então o mesmo produto vindo das duas origens continua com o mesmo
   EAN/descrição/embalagem.
 
+Sinalização de divergência (sem mudar a identidade): cada item tem uma âncora —
+o EAN, quando existe, ou o par (fornecedor, cProd). Se a mesma âncora já aparece
+no histórico com descrição/cProd diferente, ou se o ``cCodigoProduto`` começa com
+``PRD`` (código interno do Omie, não o cProd do fornecedor), o item é marcado em
+``itens_auditados`` com motivo ``divergencia_produto``/``revisar_vinculacao`` e o
+resumo traz ``divergencias``. As chaves dessas pendências começam com
+``DIV_``/``VINC_`` (nunca ``DESC_``), então os relatórios continuam usando os
+itens normalmente até a revisão manual — a importação NÃO altera a identidade
+automática nesta etapa.
+
 Deduplicação: a chave de acesso (44 dígitos) é única em ``notas_fiscais``. Nota
 já gravada é contada como **duplicada** e ignorada (sem tocar nos itens), o que
 permite rodar a sincronização quantas vezes for preciso — inclusive quando a
@@ -70,12 +80,14 @@ from backend.aprendizado_produtos import (
     normalizar_cnpj,
     normalizar_codigo_produto,
     normalizar_quantidades,
+    normalizar_texto,
     registrar_aprendizado,
 )
 from backend.cripto_credenciais import criptografar, descriptografar
 from backend.marcas import recalcular_marcas
 from backend.models import (
     Fornecedor,
+    ItemAuditado,
     ItemNota,
     MapeamentoFornecedorProduto,
     NotaFiscal,
@@ -204,6 +216,18 @@ CFOPS_BONIFICACAO = {"5910", "6910"}
 TERMOS_BONIFICACAO = ("BONIFIC", "BRINDE", "DOACAO", "DOAÇÃO", "DOAÃ")
 # Quantas notas novas o retorno carrega para o script imprimir (o total é sempre exato).
 LIMITE_AMOSTRA = 5
+# ── Detecção de divergência de produto (só sinaliza; NÃO altera a identidade) ──
+# Motivos gravados em ``itens_auditados.motivo``. As chaves desses registros
+# começam com ``DIV_``/``VINC_`` (nunca ``DESC_``), então o mapa de auditoria dos
+# relatórios as ignora: o item continua contando normalmente enquanto o admin
+# revisa. É o mesmo mecanismo de pendências da Auditoria, sem criar tabela nova.
+MOTIVO_DIVERGENCIA_PRODUTO = "divergencia_produto"
+MOTIVO_REVISAR_VINCULACAO = "revisar_vinculacao"
+# ``cCodigoProduto`` com este prefixo é o código INTERNO do Omie (PRD00001...),
+# não o cProd do fornecedor que o de-para usa como chave.
+PREFIXO_CODIGO_INTERNO_OMIE = "PRD"
+# Quantas divergências o resumo carrega (os contadores são sempre exatos).
+LIMITE_AMOSTRA_DIVERGENCIAS = 20
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -309,6 +333,278 @@ def _dados_do_recebimento(recebimento: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Divergência de produto: âncora + histórico (SÓ sinaliza, não muda identidade)
+# ──────────────────────────────────────────────────────────────────────────────
+def _ean_valido(valor: Any) -> bool:
+    """True para EAN real (não vazio, ``SEM_EAN``/``SEM GTIN``/``0``)."""
+    texto = _texto(valor).upper()
+    return bool(texto) and texto not in {"SEM_EAN", "SEM GTIN", "0"}
+
+
+def _ancora_do_item(
+    item: Dict[str, Any], fornecedor_id: Optional[int]
+) -> Optional[Tuple[Any, ...]]:
+    """Âncora de identidade do item.
+
+    ``("EAN", ean)`` quando o item tem código de barras real (o EAN é global e
+    identifica o produto mesmo entre fornecedores); senão
+    ``("FORNECEDOR_PRODUTO", fornecedor_id, cProd)`` — a mesma chave da memória
+    de-para. Sem EAN, sem fornecedor ou sem cProd não há como comparar: ``None``.
+    """
+    if _ean_valido(item.get("ean")):
+        return ("EAN", _texto(item.get("ean")))
+    c_prod = normalizar_codigo_produto(item.get("c_prod"))
+    if c_prod and fornecedor_id is not None:
+        return ("FORNECEDOR_PRODUTO", fornecedor_id, c_prod)
+    return None
+
+
+def _ancora_legivel(ancora: Optional[Tuple[Any, ...]]) -> str:
+    """Texto da âncora para o resumo (não é gravado no banco)."""
+    if not ancora:
+        return ""
+    if ancora[0] == "EAN":
+        return f"EAN {ancora[1]}"
+    return f"fornecedor {ancora[1]} + cProd {ancora[2]}"
+
+
+class _HistoricoIdentidade:
+    """Índices de identidade já gravados, carregados sob demanda.
+
+    Comparar item a item direto no banco seria uma consulta por item. Aqui o
+    índice por EAN e por (fornecedor, cProd) é montado uma vez e reaproveitado
+    por todas as notas da execução. O mapa de-para (já carregado inteiro em
+    ``sincronizar_recebimentos``) também é indexado por EAN, para pegar o caso
+    em que o mesmo código de barras aparece com outro cProd/descrição.
+    """
+
+    LIMITE_HISTORICO = 100
+
+    def __init__(self, db, mapa_aprendizado):
+        self.db = db
+        self.mapa = mapa_aprendizado
+        self._mapa_por_ean: Dict[str, List[Any]] = {}
+        self._itens_por_ean: Dict[str, List[Any]] = {}
+        self._itens_por_fornecedor_prod: Dict[Tuple[int, str], List[Any]] = {}
+        for mapeamento in mapa_aprendizado.values():
+            ean = _texto(getattr(mapeamento, "ean_padrao", ""))
+            if _ean_valido(ean):
+                self._mapa_por_ean.setdefault(ean, []).append(mapeamento)
+
+    def mapeamentos_do_ean(self, ean: str) -> List[Any]:
+        return self._mapa_por_ean.get(ean, [])
+
+    def mapeamento_do_fornecedor(self, cnpj: str, c_prod: str):
+        if not cnpj or not c_prod:
+            return None
+        return self.mapa.get(
+            (normalizar_cnpj(cnpj), normalizar_codigo_produto(c_prod))
+        )
+
+    def itens_do_ean(self, ean: str) -> List[Any]:
+        if ean not in self._itens_por_ean:
+            encontrados = (
+                self.db.query(
+                    ItemNota.descricao_produto,
+                    ItemNota.c_prod,
+                    ItemNota.fornecedor_id,
+                )
+                .filter(ItemNota.ean == ean)
+                .order_by(ItemNota.id)
+                .limit(self.LIMITE_HISTORICO)
+                .all()
+            )
+            # Não guarda vazio: o próximo item da MESMA nota (ainda não commitado
+            # quando a primeira consulta rodou) pode ser o primeiro histórico.
+            if encontrados:
+                self._itens_por_ean[ean] = encontrados
+            return encontrados
+        return self._itens_por_ean[ean]
+
+    def itens_do_fornecedor_prod(self, fornecedor_id: int, c_prod: str) -> List[Any]:
+        chave = (fornecedor_id, c_prod)
+        if chave not in self._itens_por_fornecedor_prod:
+            encontrados = (
+                self.db.query(ItemNota.descricao_produto, ItemNota.ean)
+                .filter(ItemNota.fornecedor_id == fornecedor_id)
+                .filter(ItemNota.c_prod == c_prod)
+                .order_by(ItemNota.id)
+                .limit(self.LIMITE_HISTORICO)
+                .all()
+            )
+            if encontrados:
+                self._itens_por_fornecedor_prod[chave] = encontrados
+            return encontrados
+        return self._itens_por_fornecedor_prod[chave]
+
+
+def _mesmo_texto(a: Any, b: Any) -> bool:
+    """Compara descrições normalizadas; vazio nunca casa (não há o que comparar)."""
+    normalizado_a = normalizar_texto(a)
+    normalizado_b = normalizar_texto(b)
+    return bool(normalizado_a) and normalizado_a == normalizado_b
+
+
+def _conflito_de_identidade(item, fornecedor, cnpj, historico) -> str:
+    """Descrição legível do primeiro conflito da âncora, ou ``""``.
+
+    Regras:
+    - âncora EAN: qualquer histórico (mapa de-para ou item já gravado) com o
+      MESMO EAN e descrição diferente é divergência. O cProd só é comparado
+      quando o histórico é do MESMO fornecedor — códigos diferentes entre
+      fornecedores distintos para o mesmo EAN são normais.
+    - âncora fornecedor + cProd: a descrição do histórico (mapa ou item) deve
+      ser a mesma; o cProd é a própria chave, então não há o que comparar.
+    """
+    ean = _texto(item.get("ean")) if _ean_valido(item.get("ean")) else ""
+    c_prod = normalizar_codigo_produto(item.get("c_prod"))
+    descricao = _texto(item.get("descricao"))
+    if not descricao:
+        return ""
+
+    if ean:
+        for mapeamento in historico.mapeamentos_do_ean(ean):
+            descricao_padrao = _texto(getattr(mapeamento, "descricao_padrao", ""))
+            if descricao_padrao and not _mesmo_texto(descricao, descricao_padrao):
+                return (
+                    f"EAN {ean} já registrado como {descricao_padrao!r} "
+                    f"(cProd {mapeamento.c_prod}) x descrição atual {descricao!r}"
+                )
+            if (
+                c_prod
+                and fornecedor is not None
+                and normalizar_cnpj(getattr(mapeamento, "cnpj_fornecedor", "")) == cnpj
+                and normalizar_codigo_produto(mapeamento.c_prod) != c_prod
+            ):
+                return (
+                    f"EAN {ean} do fornecedor {cnpj} já vinculado ao cProd "
+                    f"{mapeamento.c_prod} x cProd atual {c_prod}"
+                )
+        for descricao_item, c_prod_item, fornecedor_item in historico.itens_do_ean(ean):
+            if _texto(descricao_item) and not _mesmo_texto(descricao, descricao_item):
+                return (
+                    f"EAN {ean} já aparece como {descricao_item!r} "
+                    f"(cProd {c_prod_item}) x descrição atual {descricao!r}"
+                )
+            if (
+                c_prod
+                and fornecedor is not None
+                and fornecedor_item == fornecedor.id
+                and normalizar_codigo_produto(c_prod_item) != c_prod
+            ):
+                return (
+                    f"EAN {ean} do fornecedor já vinculado ao cProd "
+                    f"{c_prod_item} x cProd atual {c_prod}"
+                )
+        return ""
+
+    if not c_prod or fornecedor is None:
+        return ""
+    mapeamento = historico.mapeamento_do_fornecedor(cnpj, c_prod)
+    if mapeamento is not None:
+        descricao_padrao = _texto(getattr(mapeamento, "descricao_padrao", ""))
+        if descricao_padrao and not _mesmo_texto(descricao, descricao_padrao):
+            return (
+                f"cProd {c_prod} do fornecedor {cnpj} já registrado como "
+                f"{descricao_padrao!r} x descrição atual {descricao!r}"
+            )
+    for descricao_item, _ean_item in historico.itens_do_fornecedor_prod(
+        fornecedor.id, c_prod
+    ):
+        if _texto(descricao_item) and not _mesmo_texto(descricao, descricao_item):
+            return (
+                f"cProd {c_prod} do fornecedor {cnpj} já aparece como "
+                f"{descricao_item!r} x descrição atual {descricao!r}"
+            )
+    return ""
+
+
+def _marcar_revisao(db, chave_marcador: str, motivo: str) -> bool:
+    """Grava (uma vez) a pendência em ``itens_auditados``; devolve se criou.
+
+    A chave NÃO começa com ``DESC_``, então `_mapa_auditoria_relatorio` não a
+    considera: o item continua nos relatórios — a pendência serve só para a
+    Auditoria revisar a vinculação. Registro já aprovado pelo admin não é
+    reaberto (a decisão humana vence a sinalização automática).
+    """
+    existente = (
+        db.query(ItemAuditado)
+        .filter(ItemAuditado.chave_identificacao == chave_marcador)
+        .first()
+    )
+    if existente is not None:
+        if not existente.auditado:
+            existente.motivo = motivo
+        return False
+    db.add(
+        ItemAuditado(
+            chave_identificacao=chave_marcador,
+            auditado=False,
+            motivo=motivo,
+        )
+    )
+    return True
+
+
+def _sinalizar_divergencias(
+    db,
+    item: Dict[str, Any],
+    fornecedor,
+    cnpj: str,
+    dados: Dict[str, Any],
+    indice: int,
+    historico: _HistoricoIdentidade,
+    resultado: Dict[str, Any],
+) -> bool:
+    """Marca o item para revisão quando a âncora conflita ou o código é ``PRD``.
+
+    Devolve ``True`` quando o item recebeu pelo menos uma sinalização. Não altera
+    a identidade do item: quem chama continua gravando EAN/descrição/cProd como
+    antes. ``resultado["divergencias"]`` acumula contadores e uma amostra.
+    """
+    conflito = _conflito_de_identidade(item, fornecedor, cnpj, historico)
+    c_prod = normalizar_codigo_produto(item.get("c_prod"))
+    motivos: List[Tuple[str, str]] = []
+    if conflito:
+        motivos.append((MOTIVO_DIVERGENCIA_PRODUTO, conflito))
+    if c_prod.startswith(PREFIXO_CODIGO_INTERNO_OMIE):
+        motivos.append(
+            (
+                MOTIVO_REVISAR_VINCULACAO,
+                f"cCodigoProduto {c_prod} é o código interno do Omie (PRD...); "
+                "confira o vínculo com o cProd do fornecedor.",
+            )
+        )
+    if not motivos:
+        return False
+
+    resumo = resultado["divergencias"]
+    resumo["total"] += 1
+    for motivo, detalhe in motivos:
+        resumo[motivo] += 1
+        prefixo = "DIV" if motivo == MOTIVO_DIVERGENCIA_PRODUTO else "VINC"
+        chave_marcador = f"{prefixo}_{dados['chave']}_{indice}"
+        if _marcar_revisao(db, chave_marcador, motivo):
+            resumo["marcadores"] += 1
+    if len(resumo["itens"]) < LIMITE_AMOSTRA_DIVERGENCIAS:
+        ancora = _ancora_do_item(item, getattr(fornecedor, "id", None))
+        resumo["itens"].append(
+            {
+                "chave": dados["chave"],
+                "numero": dados["numero"],
+                "fornecedor": dados["fornecedor"],
+                "item": indice,
+                "ancora": _ancora_legivel(ancora),
+                "c_prod": item.get("c_prod") or "",
+                "ean": item.get("ean") or "",
+                "descricao": item.get("descricao") or "",
+                "motivos": {motivo: detalhe for motivo, detalhe in motivos},
+            }
+        )
+    return True
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -473,6 +769,7 @@ def _importar_recebimento(
     vistas: Set[str],
     fornecedores: Dict[str, Fornecedor],
     mapa_aprendizado: Dict[Tuple[str, str], Any],
+    historico: _HistoricoIdentidade,
     confirmar: bool,
     notas_novas: List[int],
 ) -> str:
@@ -486,6 +783,11 @@ def _importar_recebimento(
 
     ``notas_novas`` recebe o id de cada nota criada nesta execução; é o recorte
     usado no fim para contar os itens que ficaram sem marca.
+
+    Antes de aplicar a identidade aprendida, cada item é comparado com o
+    histórico por :func:`_sinalizar_divergencias`: divergência de descrição/
+    cProd na mesma âncora e código interno ``PRD...`` viram pendências na
+    Auditoria. A identidade gravada NÃO muda por causa disso.
     """
     dados = _dados_do_recebimento(recebimento)
 
@@ -537,10 +839,25 @@ def _importar_recebimento(
         notas_novas.append(nota.id)
 
     itens_gravados = 0
-    for bruto in dados["itens"]:
+    nota_sinalizada = False
+    for indice, bruto in enumerate(dados["itens"], start=1):
         if _item_bonificado(bruto):
             resultado["bonificados"] += 1
             continue
+
+        # Só sinaliza (itens_auditados); a identidade abaixo continua igual.
+        if _sinalizar_divergencias(
+            db,
+            bruto,
+            fornecedor,
+            dados["cnpj"],
+            dados,
+            indice,
+            historico,
+            resultado,
+        ) and not nota_sinalizada:
+            resultado["divergencias"]["notas"] += 1
+            nota_sinalizada = True
 
         chave_aprendizado = None
         mapeamento = None
@@ -678,7 +995,10 @@ def sincronizar_recebimentos(
         ``notas_sem_itens``, ``fornecedores_novos``, ``fornecedores_atualizados``,
         ``mapeamentos_criados``, ``mapeamentos_usados``, ``etapas`` (total por
         etapa), ``notas_novas`` (amostra), ``itens_sem_marca`` (itens das notas
-        importadas que ficaram sem marca), ``avisos`` (lista legível de avisos,
+        importadas que ficaram sem marca), ``divergencias`` (itens sinalizados
+        para revisão: ``total``, ``notas``, ``divergencia_produto``,
+        ``revisar_vinculacao``, ``marcadores`` e a amostra ``itens``),
+        ``avisos`` (lista legível de avisos,
         ex.: itens sem marca), ``erros`` (lista legível), ``periodo``,
         ``origem_credenciais`` e ``simulado``.
 
@@ -733,6 +1053,17 @@ def sincronizar_recebimentos(
         "mapeamentos_usados": 0,
         "notas_novas": [],
         "itens_sem_marca": 0,
+        # Resumo da sinalização de identidade (não altera nada): ``total`` conta
+        # itens sinalizados, os motivos contam sinalizações (um item pode ter os
+        # dois) e ``marcadores`` conta linhas novas em itens_auditados.
+        "divergencias": {
+            "total": 0,
+            "notas": 0,
+            "divergencia_produto": 0,
+            "revisar_vinculacao": 0,
+            "marcadores": 0,
+            "itens": [],
+        },
         "avisos": [],
         "erros": [],
         "origem_credenciais": origem_credenciais,
@@ -749,6 +1080,8 @@ def sincronizar_recebimentos(
         (m.cnpj_fornecedor, m.c_prod): m
         for m in db.query(MapeamentoFornecedorProduto).all()
     }
+    # Índices de identidade para a sinalização de divergências (só leitura).
+    historico = _HistoricoIdentidade(db, mapa_aprendizado)
 
     for etapa in etapas_limpas:
         rotulo = NOME_ETAPA.get(etapa, etapa)
@@ -787,6 +1120,7 @@ def sincronizar_recebimentos(
                     vistas,
                     fornecedores,
                     mapa_aprendizado,
+                    historico,
                     confirmar,
                     notas_novas,
                 )
