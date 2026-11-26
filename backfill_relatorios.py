@@ -18,6 +18,7 @@ import os
 import re
 import xml.etree.ElementTree as ET
 
+from backend.aprendizado_produtos import limpar_entidades_texto
 from backend.database import PROJECT_ROOT, SessionLocal, init_db
 from backend.models import Empresa, ItemNota, NotaFiscal
 
@@ -78,7 +79,9 @@ def _cfops_do_xml(caminho):
         if prod is None:
             continue
         cfop = _texto(prod, "CFOP")
-        descricao = _texto(prod, "xProd").strip().upper()
+        # O XML pode vir com entidade escapada ("&amp;"/"&amp;amp;"): a nota é gravada
+        # com o texto limpo, então a chave de comparação também precisa ser limpa.
+        descricao = limpar_entidades_texto(_texto(prod, "xProd")).strip().upper()
         if not cfop or not descricao:
             continue
         try:

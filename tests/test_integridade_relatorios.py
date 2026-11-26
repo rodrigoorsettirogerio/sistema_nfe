@@ -77,6 +77,10 @@ Cobre as regras de negócio dos relatórios (Evolução, Comparativo e Impacto):
     canônico usado na chave e os relatórios NÃO convertem 1 CX = 24 UN para média/variação;
     a Auditoria de Divergências mostra a última compra de cada descrição (vermelha quando
     a pendência é variação brusca ≥ 50%) e mantém Validar/Mover/Ver DANFE.
+19. entidades HTML/XML do texto do item (`&amp;`, `&amp;amp;`) são decodificadas na
+    ENTRADA por `limpar_entidades_texto` (importador de XML, leitura do Omie e
+    aprendizado do produto), sem tocar em `&` que faz parte da descrição — o resíduo
+    "AMP" não pode virar parte do nome do produto nem marca.
 
 Para os testes de admin existe `conta_admin_teste()`: cria uma conta de teste, liga a
 flag `is_admin` direto no banco e ativa o 2FA (`_ativar_2fa`), registrando o token do
@@ -255,6 +259,48 @@ def test_item_bonificado_no_xml():
         <vUnCom>22.90</vUnCom><vProd>22.90</vProd></prod><infAdProd/></det>"""
     prod, det = _det(xml_normal)
     assert not item_bonificado(prod, det, NS), "item com preço normal não é bonificação"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Entidades HTML/XML no texto do item (entrada do importador e do aprendizado)
+# ──────────────────────────────────────────────────────────────────────────────
+@teste
+def test_entidades_html_decodificadas_na_entrada():
+    """XML escapado ("&amp;"/"&amp;amp;") entra decodificado; "&" comum é preservado.
+
+    O Omie e alguns emissores mandam o `xProd` escapado. A decodificação acontece na
+    ENTRADA (`limpar_entidades_texto`): sem ela o "&amp;" vira parte do nome do produto
+    e o resíduo "AMP" podia ser lido como marca na inferência.
+    """
+    limpar = baprendizado.limpar_entidades_texto
+    assert limpar("&amp; SKIRT STEAK") == "& SKIRT STEAK"
+    assert limpar("&amp;amp; SKIRT STEAK") == "& SKIRT STEAK", "escapado 2x também decodifica"
+    assert limpar("PEITO & FRANGO") == "PEITO & FRANGO", "o & comum não pode sumir"
+    assert limpar(None) == ""
+    assert limpar("SAL &amp; PIMENTA 1KG") == "SAL & PIMENTA 1KG"
+
+    # Item do XML do importador: mesma limpeza na leitura de xProd/infAdProd/xNome.
+    prod, det = _det(
+        """<det><prod><xProd>&amp;amp; SKIRT STEAK</xProd></prod>
+        <infAdProd>LOTE &amp; VALIDADE</infAdProd></det>"""
+    )
+    assert import_xmls._texto_item(prod, "xProd", NS) == "& SKIRT STEAK"
+    assert import_xmls._texto_item(det, "infAdProd", NS) == "LOTE & VALIDADE"
+
+    # Importador de aprendizado: relê o arquivo da nota e devolve a descrição limpa.
+    xml = (
+        '<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe"><NFe><infNFe>'
+        '<det nItem="1"><prod><cProd>SKU-1</cProd>'
+        "<xProd>&amp;amp; SKIRT STEAK</xProd><qCom>2.0000</qCom>"
+        "<vUnCom>30.00</vUnCom><uCom>KG</uCom><cEAN>7891234567890</cEAN>"
+        "</prod></det></infNFe></NFe></nfeProc>"
+    )
+    with tempfile.TemporaryDirectory() as diretorio:
+        caminho = Path(diretorio) / "nota_entidades.xml"
+        caminho.write_text(xml, encoding="utf-8")
+        itens = baprendizado._itens_do_xml(caminho)
+    assert itens and itens[0]["descricao"] == "& SKIRT STEAK", itens
+    assert itens[0]["c_prod"] == "SKU-1", itens
 
 
 # ──────────────────────────────────────────────────────────────────────────────

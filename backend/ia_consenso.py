@@ -73,6 +73,13 @@ MARCAS_INVALIDAS = frozenset(
         # Embalagens e categorias de limpeza.
         "CAIXA", "CX", "FD", "FARDO", "PACOTE", "PCT", "GARRAFA", "LATA", "SACHE",
         "DETERGENTE", "DESINFETANTE", "SANITARIA", "LIMPEZA",
+        # Adjetivos/estado/origem e pedaços do nome do produto que a IA ou a
+        # heurística local devolvem como se fossem fabricante: "VERDE", "GRANDE",
+        # "ZERO" descrevem o produto; KAL/PLAST/AMP costumam ser abreviação ou
+        # resto de entidade HTML ("&amp;" -> AMP). Nenhum deles individualiza o
+        # item, então não podem virar marca nem alias de marca composta.
+        "VERDE", "GRANDE", "ZERO", "STEAK", "ORIGEM", "KAL", "CAMPO", "PET",
+        "PLAST", "SACO", "FRALDA", "DIAFRAGMA", "DIAPHRAGMA", "ENTRANHA", "AMP",
     }
 )
 # Abreviações de marca que os fornecedores usam nas descrições (a NF-e não tem o
@@ -224,13 +231,45 @@ def _marca_conhecida_na_descricao(descricao) -> str:
 # Palavras que aparecem em NOMES DE MARCA, mas são tipo/categoria do produto.
 # Elas não viram token isolado (senão "GIN" ou "XAROPE" marcariam qualquer
 # descrição); o nome completo da marca continua valendo como frase.
+# A lista inclui os adjetivos/estado/origem que mais apareciam como falso
+# positivo (VERDE, GRANDE, ZERO, STEAK...) e restos de entidade (AMP).
 PALAVRAS_GENERICAS_DE_MARCA = frozenset(
     {
         "A", "AS", "COM", "DA", "DAS", "DE", "DEL", "DO", "DOS", "E", "O", "OS",
         "APERITIVO", "CACACA", "COPOS", "EMBALAGENS", "GIN", "LICOR", "PROFESSIONAL",
         "SAQUE", "TEQUILA", "VERMOUTH", "WHISKY", "XAROPE",
+        "VERDE", "GRANDE", "ZERO", "STEAK", "ORIGEM", "KAL", "CAMPO", "PET",
+        "PLAST", "SACO", "FRALDA", "DIAFRAGMA", "DIAPHRAGMA", "ENTRANHA", "AMP",
     }
 )
+# Uma marca de 2+ palavras só gera alias de UMA palavra quando ela é distintiva:
+# pelo menos 5 letras e fora de termos genéricos/unidades/cortes. Assim
+# "GIN GORDONS" → GORDONS, mas "VERDE CAMPO" não casa com qualquer "VERDE".
+MINIMO_LETRAS_ALIAS_ISOLADO = 5
+# Cache de unidades/cortes/qualificadores de `backend.marcas` (import tardio para
+# este módulo continuar independente das regras de inferência por NCM).
+_TERMOS_DE_PRODUTO = None
+
+
+def _termos_de_produto() -> frozenset:
+    """Unidades, embalagens, cortes e qualificadores que nunca viram alias só."""
+    global _TERMOS_DE_PRODUTO
+    if _TERMOS_DE_PRODUTO is None:
+        from backend import marcas as regras_marcas
+
+        _TERMOS_DE_PRODUTO = frozenset(regras_marcas.UNIDADES) | frozenset(
+            regras_marcas.QUALIFICADORES
+        )
+    return _TERMOS_DE_PRODUTO
+
+
+def _alias_isolado_valido(parte: str) -> bool:
+    """True quando uma palavra de marca COMPOSTA pode valer como alias sozinha."""
+    if len(parte) < MINIMO_LETRAS_ALIAS_ISOLADO or parte.isdigit():
+        return False
+    if parte in PALAVRAS_GENERICAS_DE_MARCA or parte in MARCAS_INVALIDAS:
+        return False
+    return parte not in _termos_de_produto()
 
 
 def _tokens_busca_marca(texto) -> List[str]:
@@ -242,65 +281,60 @@ def _tokens_busca_marca(texto) -> List[str]:
 def _aliases_da_marca(nome) -> List[str]:
     """Formas pelas quais uma marca pode aparecer na descrição.
 
-    Além do nome completo, usa cada palavra significativa e pares vizinhos
-    concatenados: "Coca-Cola" → ``COCA COLA``/``COCACOLA``;
-    "Gin Gordon's" → ``GORDON``/``GORDONS``. Palavras genéricas de categoria
-    ficam de fora para não gerar falso positivo.
+    Regras (guardas contra falso positivo):
+    - o nome completo sempre vale como frase ("VILLA PIVA");
+    - marca de UMA palavra (SADIA) também vale isolada;
+    - marca de 2+ palavras só gera alias de uma palavra quando ele é DISTINTIVO
+      (>= 5 letras e fora de termos genéricos/unidades/cortes), para "VERDE
+      CAMPO" não casar com qualquer "VERDE" da descrição;
+    - pares vizinhos concatenados continuam valendo ("COCA COLA" → COCACOLA).
     """
     partes = _tokens_busca_marca(nome)
     if not partes:
         return []
     aliases = {" ".join(partes)}
-    significativas = [
-        parte
-        for parte in partes
-        if len(parte) >= 3
-        and not parte.isdigit()
-        and parte not in PALAVRAS_GENERICAS_DE_MARCA
-    ]
-    aliases.update(significativas)
-    for esquerda, direita in zip(partes, partes[1:]):
-        if (
-            len(esquerda) >= 3
-            and len(direita) >= 1
-            and not esquerda.isdigit()
-            and not direita.isdigit()
-            and esquerda not in PALAVRAS_GENERICAS_DE_MARCA
-            and direita not in PALAVRAS_GENERICAS_DE_MARCA
-        ):
-            aliases.add(esquerda + direita)
+    if len(partes) == 1:
+        aliases.add(partes[0])
+    else:
+        aliases.update(parte for parte in partes if _alias_isolado_valido(parte))
+        for esquerda, direita in zip(partes, partes[1:]):
+            if (
+                len(esquerda) >= 3
+                and len(direita) >= 1
+                and not esquerda.isdigit()
+                and not direita.isdigit()
+                and esquerda not in PALAVRAS_GENERICAS_DE_MARCA
+                and direita not in PALAVRAS_GENERICAS_DE_MARCA
+            ):
+                aliases.add(esquerda + direita)
     return sorted(aliases, key=len, reverse=True)
 
 
 def _marca_por_tokenizacao(descricao, sessao) -> str:
-    """NÍVEL 2: marca conhecida (`marcas_master`/`marcas_ia`) citada na descrição.
+    """NÍVEL 2: marca do catálogo mestre (`marcas_master`) citada na descrição.
 
-    Consulta o catálogo mestre e as marcas já memorizadas em `marcas_ia`. As
-    frases completas têm prioridade sobre tokens isolados ("GUARANA ANTARCTICA"
-    antes de "ANTARCTICA"), e a primeira marca encontrada na ordem dos tokens é
-    devolvida. Retorna ``""`` quando nenhuma marca conhecida aparece.
+    Consulta SÓ o catálogo mestre e a lista curta `MARCAS_CONHECIDAS`. As marcas
+    memorizadas em `marcas_ia` não entram como candidatas de propósito: a memória é
+    entrada do cache (candidato no NÍVEL 1), não catálogo — usar as respostas
+    antigas aqui transformava um palpite de IA em regra fixa e autoalimentava o
+    erro ("VERDE", "STEAK", ...). As frases completas têm prioridade sobre tokens
+    isolados ("GUARANA ANTARCTICA" antes de "ANTARCTICA"), e a primeira marca
+    encontrada na ordem dos tokens é devolvida. Retorna ``""`` quando nenhuma marca
+    conhecida aparece.
     """
     tokens = _tokens_busca_marca(descricao)
     if not tokens:
         return ""
     texto = f" {' '.join(tokens)} "
 
-    from backend.models import MarcaIA, MarcaMaster
+    from backend.models import MarcaMaster
 
-    candidatos = []
-    for (nome,) in (
-        sessao.query(MarcaMaster.nome_marca)
+    candidatos = [
+        nome
+        for (nome,) in sessao.query(MarcaMaster.nome_marca)
         .order_by(MarcaMaster.nome_marca.asc())
         .all()
-    ):
-        candidatos.append(nome)
-    for (marca,) in (
-        sessao.query(MarcaIA.marca_extraida)
-        .filter(MarcaIA.marca_extraida.isnot(None))
-        .distinct()
-        .all()
-    ):
-        candidatos.append(marca)
+    ]
     candidatos.extend(MARCAS_CONHECIDAS.values())
 
     mapa = {}
@@ -320,6 +354,68 @@ def _marca_por_tokenizacao(descricao, sessao) -> str:
         if token in mapa:
             return _completar_marca(mapa[token])
     return ""
+
+
+def _chave_marca(texto) -> str:
+    """Forma canônica do nome, para comparar marca da IA x marca do catálogo."""
+    return " ".join(_tokens_busca_marca(texto))
+
+
+def _marca_no_catalogo(marca, sessao) -> bool:
+    """True quando `marca` existe em `marcas_master` (ou na lista `MARCAS_CONHECIDAS`).
+
+    A comparação ignora acento, caixa e pontuação ("Villa Piva" == "VILLA PIVA").
+    """
+    from backend.models import MarcaMaster
+
+    chave = _chave_marca(marca)
+    if not chave:
+        return False
+    if chave in {_chave_marca(nome) for nome in MARCAS_CONHECIDAS.values()}:
+        return True
+    return any(
+        _chave_marca(nome_marca) == chave
+        for (nome_marca,) in sessao.query(MarcaMaster.nome_marca).all()
+    )
+
+
+def _marca_na_descricao(marca, descricao) -> bool:
+    """True quando a marca aparece na própria descrição (palavras contíguas).
+
+    A comparação roda sobre a descrição normalizada e exige fronteira de palavra,
+    para "SUCO" não casar dentro de "SUCOS". "COCA-COLA" aceita "COCA COLA" e a
+    abreviação conhecida do catálogo também confirma a marca ("SCHW" → SCHWEPPES).
+    """
+    texto = _normalizar_descricao_memoria(descricao).replace("_", " ")
+    partes = _tokens_busca_marca(marca)
+    if not texto or not partes:
+        return False
+    chave = " ".join(partes)
+    for abreviacao, completa in MARCAS_ABREVIACOES.items():
+        if _chave_marca(completa) == chave and re.search(
+            r"(?<![A-Z0-9])" + re.escape(abreviacao) + r"(?![A-Z0-9])", texto
+        ):
+            return True
+    sequencia = r"[^A-Z0-9]*".join(re.escape(parte) for parte in partes)
+    return bool(re.search(r"(?<![A-Z0-9])" + sequencia + r"(?![A-Z0-9])", texto))
+
+
+def _marca_aceitavel(marca, descricao, sessao) -> bool:
+    """Resposta da IA só vale se for VERIFICÁVEL (catálogo mestre ou descrição).
+
+    A IA às vezes preenche o campo com um palpite ("VERDE", "GRANDE", uma grife
+    que não existe no texto) só para não devolver vazio. Sem esta trava o palpite
+    vira cache (`marcas_ia`) e contamina todas as próximas rodadas. A marca é
+    aceita quando:
+    - não é sentinela nem termo genérico (`MARCAS_INVALIDAS`); e
+    - existe em `marcas_master`/`MARCAS_CONHECIDAS`; ou
+    - aparece na própria descrição normalizada (todas as palavras do nome,
+      admitindo a abreviação conhecida no lugar do nome completo).
+    Fora disso a resposta é tratada como "SEM MARCA".
+    """
+    if not marca or eh_sem_marca(marca) or _marca_invalida(marca):
+        return False
+    return _marca_no_catalogo(marca, sessao) or _marca_na_descricao(marca, descricao)
 
 
 def limpar_memoria_marcas_invalidas(db=None) -> int:
@@ -841,11 +937,14 @@ def obter_marca_inteligente(
          sem chamar a DeepSeek. Resposta antiga com termo genérico (OSSO, TRANSP...)
          ou "SEM MARCA" para uma marca conhecida é APAGADA e tratada como cache miss;
       2. NÍVEL 2 — TOKENIZAÇÃO: quebra a descrição em palavras e procura cada uma
-         (e o nome completo) no catálogo `marcas_master` e nas marcas já memorizadas
-         em `marcas_ia`. Se encontrar, grava a DESCRIÇÃO COMPLETA com essa marca em
-         `marcas_ia` e devolve — sem gastar tokens;
+         (e o nome completo) no catálogo `marcas_master`. Se encontrar, grava a
+         DESCRIÇÃO COMPLETA com essa marca em `marcas_ia` e devolve — sem gastar
+         tokens. As respostas antigas de `marcas_ia` NÃO entram como candidatas
+         (memória não é catálogo: um palpite salvo não pode virar regra);
       3. NÍVEL 3 — IA: quando nada foi encontrado e `usar_ia=True`, envia a DESCRIÇÃO
-         COMPLETA no prompt, grava descrição + marca + data e devolve o resultado;
+         COMPLETA no prompt, grava descrição + marca + data e devolve o resultado.
+         O palpite só é aceito se estiver em `marcas_master`/`MARCAS_CONHECIDAS`
+         ou aparecer na descrição; caso contrário vira ``"SEM MARCA"``;
       4. se a IA está desabilitada e a cascata não resolveu, devolve ``None`` (cache
          miss) para o recálculo cair na heurística local.
 
@@ -945,7 +1044,12 @@ def obter_marca_inteligente(
                 max_tokens=120,
             )
             resultado = _extrair_marca_da_resposta(conteudo)
-        if resultado != MARCA_SEM_MARCA and _marca_invalida(resultado):
+        # Trava final: o palpite da IA só é memorizado se for verificável (catálogo
+        # mestre ou texto da descrição). Sem isso "VERDE"/"GRANDE"/grife inventada
+        # entraria no cache e voltaria como acerto em todas as próximas rodadas.
+        if resultado != MARCA_SEM_MARCA and not _marca_aceitavel(
+            resultado, descricao_completa, sessao
+        ):
             resultado = MARCA_SEM_MARCA
         resultado = _gravar_resultado_memoria(sessao, chave, resultado)
         _incrementar(

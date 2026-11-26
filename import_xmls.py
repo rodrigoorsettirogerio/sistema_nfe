@@ -15,6 +15,7 @@ from backend.models import (
 from backend.aprendizado_produtos import (
     aplicar_embalagem_aprendida,
     aplicar_identidade,
+    limpar_entidades_texto,
     normalizar_cnpj,
     normalizar_codigo_produto,
     normalizar_quantidades,
@@ -32,7 +33,11 @@ TERMOS_BONIFICACAO = ("BONIFIC", "BRINDE", "DOACAO", "DOAÇÃO", "DOAÃ")
 
 
 def _texto_item(elemento, tag, ns):
-    """Texto de uma tag do XML (com ou sem namespace), já sem espaços."""
+    """Texto de uma tag do XML (com ou sem namespace), já sem espaços e sem entidade.
+
+    O emissor pode escapar o texto ("&amp; SKIRT STEAK"); a decodificação acontece
+    aqui, na ENTRADA, para xProd/xNome/infAdProd chegarem limpos na chave do produto.
+    """
     if elemento is None:
         return ""
     # Sem `or` entre os `find`: um Element sem filhos é "falso" no ElementTree, então a
@@ -40,7 +45,7 @@ def _texto_item(elemento, tag, ns):
     for caminho in (f"nfe:{tag}", f"{{http://www.portalfiscal.inf.br/nfe}}{tag}", tag):
         achado = elemento.find(caminho, ns)
         if achado is not None and achado.text:
-            return achado.text.strip()
+            return limpar_entidades_texto(achado.text.strip())
     return ""
 
 
@@ -243,7 +248,8 @@ def importar_com_ean_e_ncm(
                 if c_cnpj is not None and c_cnpj.text:
                     cnpj_emit = c_cnpj.text.strip()
                 if c_nome is not None and c_nome.text:
-                    nome_emit = c_nome.text.strip()
+                    # xNome do emitente pode vir com entidade ("&amp;" -> "&").
+                    nome_emit = limpar_entidades_texto(c_nome.text.strip())
 
             fornecedor = db.query(Fornecedor).filter(Fornecedor.cnpj == cnpj_emit).first()
             if not fornecedor:
@@ -326,7 +332,13 @@ def importar_com_ean_e_ncm(
                     else:
                         ean = "SEM_EAN"
 
-                    desc = xProd.text.strip() if xProd is not None and xProd.text else ""
+                    # xProd é o texto livre do fornecedor: entra limpo na chave do
+                    # produto (sem "&amp;"/"&amp;amp;" nem o resíduo "AMP").
+                    desc = (
+                        limpar_entidades_texto(xProd.text.strip())
+                        if xProd is not None and xProd.text
+                        else ""
+                    )
                     qtd = float(qCom.text.strip()) if qCom is not None and qCom.text else 0.0
                     v_un = float(vUnCom.text.strip()) if vUnCom is not None and vUnCom.text else 0.0
                     ncm = c_ncm.text.strip() if c_ncm is not None and c_ncm.text else "00000000"

@@ -80,7 +80,19 @@ QUALIFICADORES = {
     "PICANHA", "ALCATRA", "COSTELA", "MAMINHA", "PATINHO", "LOMBO", "FILE", "FRALDA",
     "MEDALHAO", "ENTRANHA", "DIAPHRAGMA", "ANCHO", "COLITA", "CUADRIL", "BEEF", "OJO",
     "SELECAO", "BLEND", "TIRA", "HUESO", "SIN", "COOPERBOI", "BOV",
+    # Estado/origem/corte e abreviações que apareciam como "marca" na inferência
+    # local: STEAK/ORIGEM/CAMPO descrevem o produto, KAL/PLAST são abreviação de
+    # embalagem e DIAFRAGMA/ENTRANHA são cortes (os dois últimos já estão acima).
+    "STEAK", "ORIGEM", "KAL", "CAMPO", "PLAST",
 }
+
+# Restos de entidade HTML/XML: quando o emissor escapa o texto, "&amp;" chega como
+# "AMP" depois da normalização (o "&" vira separador). Nunca é marca.
+RESTOS_DE_ENTIDADE = {"AMP", "LT", "GT", "QUOT", "APOS", "NBSP"}
+# Siglas de marca realmente conhecidas na base. Toda outra sigla de 2-3 letras é
+# abreviação de adjetivo/embalagem ("FGO", "PLAST") e não individualiza o item: a
+# marca fica NULL em vez de virar lixo na chave do relatório.
+SIGLAS_DE_MARCA = {"YPE", "FTA", "FSW"}
 
 # NCM "vazio" (o importador usa 00000000 quando o XML não traz o campo).
 NCM_VAZIO = "00000000"
@@ -169,16 +181,32 @@ def termos_genericos(descricoes: Iterable[str]) -> set:
     }
 
 
+def _token_sem_valor_de_marca(token: str) -> bool:
+    """True para token que nunca individualiza a marca da descrição.
+
+    Três grupos: resto de entidade HTML ("&amp;" → AMP), unidade/embalagem/corte/
+    qualificador (já saem em `tokens`, mas a checagem é feita aqui também para o
+    caso de o vocabulário crescer só em um dos lados) e sigla desconhecida de 2-3
+    letras — sem catálogo não há como afirmar que é fabricante, e como marca ela só
+    polui a chave do relatório.
+    """
+    if token in RESTOS_DE_ENTIDADE or token in UNIDADES or token in QUALIFICADORES:
+        return True
+    return len(token) <= 3 and token not in SIGLAS_DE_MARCA
+
+
 def extrair_marca(descricao, genericos: Iterable[str] = ()) -> Optional[str]:
     """Marca inferida da descrição (None quando não sobra nenhum token próprio).
 
     O nome do produto pode estar antes ou depois da marca — por isso o critério é "o que
     VARIA entre as descrições do mesmo NCM": os termos genéricos do NCM saem da lista e a
-    marca é o primeiro token que sobra.
+    marca é o primeiro token que sobra. Restos de entidade ("AMP"), unidades/cortes e
+    siglas desconhecidas de 2-3 letras também são descartados (`_token_sem_valor_de_marca`):
+    é melhor devolver None do que gravar um pedaço de adjetivo como marca.
     """
     genericos = {str(token).upper() for token in genericos or ()}
     for token in tokens(descricao):
-        if token not in genericos:
+        if token not in genericos and not _token_sem_valor_de_marca(token):
             return token
     return None
 

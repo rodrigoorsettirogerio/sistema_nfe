@@ -4,9 +4,12 @@ Cobrem:
 - o catálogo `popular_marcas_master.py` (204 nomes únicos, idempotente);
 - a carga de `marcas_novas.txt` por `importar_marcas_novas.py` (idempotente e sem duplicar acentos/caixa);
 - NÍVEL 1 da cascata (cache exato em `marcas_ia`);
-- NÍVEL 2 (tokenização contra `marcas_master` e marcas já vistas em `marcas_ia`);
+- NÍVEL 2 (tokenização contra `marcas_master` e a lista curta `MARCAS_CONHECIDAS`);
+- a memória `marcas_ia` é CACHE, não catálogo de aliases (palpite antigo não vira regra);
+- a resposta da IA só é memorizada quando é verificável (catálogo mestre ou descrição);
 - correção de cache antigo "SEM MARCA" quando o catálogo conhece a marca;
-- NÍVEL 3 (DeepSeek) quando nenhuma fonte local encontra a marca.
+- NÍVEL 3 (DeepSeek) quando nenhuma fonte local encontra a marca;
+- alias de marca composta não usa palavra genérica ("VERDE CAMPO" ≠ VERDE).
 
 Roda sem backend e sem a base real:
     python tests/test_marcas_master.py
@@ -163,7 +166,13 @@ def test_tokenizacao_usa_catalogo_master_e_memoriza_descricao():
         engine.dispose()
 
 
-def test_tokenizacao_usa_marcas_ja_memorizadas():
+def test_memoria_nao_e_catalogo_de_aliases():
+    """`marcas_ia` é CACHE: um palpite antigo não pode virar regra fixa.
+
+    O registro "OUTRO PRODUTO QUALQUER → ARRICO" não pode fazer qualquer "POLENTA
+    PALITO CONG CX" virar ARRICO: sem catálogo mestre e sem a marca no texto, a
+    cascata local não resolve e a IA é chamada (aqui devolve ``SEM MARCA``).
+    """
     db, engine = _banco_temporario()
     try:
         db.add(
@@ -176,14 +185,50 @@ def test_tokenizacao_usa_marcas_ja_memorizadas():
         with patch.object(
             ia_consenso,
             "_chamar_deepseek",
-            side_effect=AssertionError("marca memorizada não pode chamar a IA"),
+            return_value=json.dumps({"sem_marca": True}),
+        ) as chamada:
+            assert (
+                ia_consenso.obter_marca_inteligente(
+                    "POLENTA PALITO CONG CX", db=db
+                )
+                == ia_consenso.MARCA_SEM_MARCA
+            )
+        assert chamada.call_count == 1, chamada.call_count
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_alias_de_marca_composta_exige_palavra_distintiva():
+    """Marca de 2+ palavras só gera alias de 1 palavra quando ele é distintivo."""
+    composta = ia_consenso._aliases_da_marca("VERDE CAMPO")
+    assert "VERDE CAMPO" in composta, composta
+    assert "VERDE" not in composta and "CAMPO" not in composta, composta
+
+    gin = ia_consenso._aliases_da_marca("GIN GORDONS")
+    assert "GORDONS" in gin, gin
+    assert "GIN" not in gin, gin
+
+    # Marca de UMA palavra continua valendo isolada (é o nome inteiro).
+    assert "SADIA" in ia_consenso._aliases_da_marca("SADIA")
+
+
+def test_resposta_da_ia_sem_confirmacao_vira_sem_marca():
+    """Palpite da IA fora do catálogo e fora do texto é gravado como SEM MARCA."""
+    db, engine = _banco_temporario()
+    try:
+        with patch.object(
+            ia_consenso,
+            "_chamar_deepseek",
+            return_value=json.dumps({"marca": "SUPERGRIFE"}, ensure_ascii=False),
         ):
             assert (
                 ia_consenso.obter_marca_inteligente(
-                    "POLENTA PALITO ARRICO CONG CX", db=db
+                    "PALHA DE MANDIOCA FINA 1KG", db=db
                 )
-                == "ARRICO"
+                == ia_consenso.MARCA_SEM_MARCA
             )
+        assert db.query(MarcaIA).one().marca_extraida == ia_consenso.MARCA_SEM_MARCA
     finally:
         db.close()
         engine.dispose()
@@ -233,7 +278,7 @@ def test_fallback_deepseek_grava_na_memoria():
         ) as chamada:
             assert (
                 ia_consenso.obter_marca_inteligente(
-                    "PALHA DE MANDIOCA FINA", db=db
+                    "PALHA DE MANDIOCA FINA YOKI 1KG", db=db
                 )
                 == "YOKI"
             )
@@ -249,9 +294,11 @@ TESTS = [
     test_importar_marcas_novas_idempotente,
     test_cache_exato_responde_sem_ia,
     test_tokenizacao_usa_catalogo_master_e_memoriza_descricao,
-    test_tokenizacao_usa_marcas_ja_memorizadas,
+    test_memoria_nao_e_catalogo_de_aliases,
+    test_alias_de_marca_composta_exige_palavra_distintiva,
     test_cache_sem_marca_e_corrigido_pelo_catalogo,
     test_fallback_deepseek_grava_na_memoria,
+    test_resposta_da_ia_sem_confirmacao_vira_sem_marca,
 ]
 
 

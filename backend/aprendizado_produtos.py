@@ -18,6 +18,7 @@ O módulo é puro Python/SQLAlchemy (sem FastAPI) — é usado pelo importador, 
 backfill (`backfill_aprendizado.py`), pelos relatórios e pelas rotas da Auditoria.
 """
 
+import html
 import re
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -151,6 +152,41 @@ _RE_EMBALAGEM_CONTEUDO = re.compile(
     r"(?:" + _SEP + r"(?:COM|C|CONTENDO|DE))?" + _SEP + r"(\d+(?:[.,]\d+)?)\s*"
     r"(KG|KGS|G|GR|GRS|MG|L|LT|LTS|ML|CL)\b"
 )
+
+
+# Entidades HTML/XML que o Omie e alguns emissores deixam escapadas no texto do
+# produto ("&amp; SKIRT STEAK"). A guarda só dispara em entidade CONHECIDA: um "&"
+# comum da descrição nunca é tocado e o laço sempre termina.
+_RE_ENTIDADE_TEXTO = re.compile(
+    r"&(amp|lt|gt|quot|apos|#\d+|#x[0-9a-f]+);", re.IGNORECASE
+)
+# Teto do laço: "&amp;amp;amp;..." (escapado várias vezes) estabiliza bem antes disso.
+LIMITE_DECODIFICACAO_ENTIDADES = 5
+
+
+def limpar_entidades_texto(texto) -> str:
+    """Remove entidades HTML/XML do texto ("&amp; Skirt Steak" -> "& Skirt Steak").
+
+    O texto pode chegar escapado UMA ou VÁRIAS vezes ("&amp;", "&amp;amp;"). A
+    decodificação roda em laço até estabilizar, com teto de segurança, e só age
+    quando a guarda `_RE_ENTIDADE_TEXTO` encontra uma entidade conhecida — assim
+    um "&" solto na descrição continua "&".
+
+    É aplicada na ENTRADA (antes de normalizar/gerar a chave): entidade
+    decodificada depois já teria virado parte do nome do produto, e o resíduo
+    ("AMP") podia até ser lido como marca.
+    """
+    if texto is None:
+        return ""
+    atual = str(texto)
+    for _ in range(LIMITE_DECODIFICACAO_ENTIDADES):
+        if not _RE_ENTIDADE_TEXTO.search(atual):
+            break
+        decodificado = html.unescape(atual)
+        if decodificado == atual:
+            break
+        atual = decodificado
+    return atual
 
 
 def normalizar_texto(texto) -> str:
@@ -604,7 +640,9 @@ def _itens_do_xml(caminho_xml):
             {
                 "c_prod": c_prod,
                 "u_com": str(campos.get("uCom") or "").strip().upper(),
-                "descricao": campos.get("xProd") or "",
+                # xProd pode vir escapado no XML ("&amp; SKIRT STEAK"): limpa na
+                # entrada para a chave (descrição/quantidade) casar com o item.
+                "descricao": limpar_entidades_texto(campos.get("xProd") or ""),
                 "quantidade": _decimal(campos.get("qCom")),
                 "ean": str(campos.get("cEAN") or "").strip().lstrip("0"),
             }
@@ -749,7 +787,9 @@ def registrar_aprendizado(
     avisos = []
     manual = str(mapeamento.origem or "").strip().lower() == "manual"
     ean = str(ean or "").strip()
-    descricao = str(descricao or "").strip()
+    # A descrição canônica é gravada aqui: limpa as entidades na entrada para a
+    # memória não guardar "&amp;" (e o "AMP" não virar marca na leitura).
+    descricao = limpar_entidades_texto(str(descricao or "")).strip()
     ncm = str(ncm or "").strip()
     ean_valido = ean.upper() not in ("", "SEM_EAN", "SEM GTIN", "0")
     embalagem = embalagem or {}

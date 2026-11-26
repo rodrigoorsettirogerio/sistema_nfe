@@ -29,6 +29,7 @@ sys.path.insert(0, str(RAIZ))
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from backend import ia_consenso as bia
 from backend import main as bmain
 from backend import marcas as bmarcas
 from backend.database import DB_PATH, init_db
@@ -108,6 +109,26 @@ def main():
     assert extraidas == ["YOKI", "MATHEUS", "DECK"], extraidas
     assert bmarcas.extrair_marca("PALHA MANDIOCA FINA TOLETE 500G", genericos) is None
     print("OK: a marca é a palavra que varia; unidade/embalagem (KG, TOLETE, G...) é ignorada.")
+
+    print()
+    print("=" * 78)
+    print("1b) GUARDAS — resto de entidade, sigla desconhecida e marca composta")
+    print("=" * 78)
+    # "&amp;" no texto vira "AMP" depois de normalizar: nunca é marca.
+    assert bmarcas.extrair_marca("SKIRT STEAK &AMP;") == "SKIRT"
+    assert bmarcas.extrair_marca("STEAK &AMP; 1KG") is None
+    # Sigla desconhecida de 2-3 letras não individualiza o item (FGO, PLAST, KAL...).
+    assert (
+        bmarcas.extrair_marca("PALHA MANDIOCA FINA FGO 1KG", {"PALHA", "MANDIOCA"})
+        is None
+    )
+    # Sigla realmente conhecida continua valendo.
+    assert bmarcas.extrair_marca("LA DE ACO YPE 45G", {"LA", "ACO"}) == "YPE"
+    # Alias de marca composta: só palavra distintiva (>= 5 letras, fora do genérico).
+    assert bia._aliases_da_marca("VERDE CAMPO") == ["VERDE CAMPO"]
+    assert "GORDONS" in bia._aliases_da_marca("GIN GORDONS")
+    assert "GIN" not in bia._aliases_da_marca("GIN GORDONS")
+    print("OK: AMP/sigla genérica descartados e alias de composta exige palavra distintiva.")
 
     with tempfile.TemporaryDirectory() as diretorio:
         db, engine = _sessao_copia(diretorio)
