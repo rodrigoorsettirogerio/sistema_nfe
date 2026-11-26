@@ -52,8 +52,29 @@ no histórico com descrição/cProd diferente, ou se o ``cCodigoProduto`` começ
 ``itens_auditados`` com motivo ``divergencia_produto``/``revisar_vinculacao`` e o
 resumo traz ``divergencias``. As chaves dessas pendências começam com
 ``DIV_``/``VINC_`` (nunca ``DESC_``), então os relatórios continuam usando os
-itens normalmente até a revisão manual — a importação NÃO altera a identidade
-automática nesta etapa.
+itens normalmente até a revisão manual.
+
+Correção da descrição pelo XML da NF-e (passo 3): a listagem de recebimentos pode
+trazer a descrição do CADASTRO interno do Omie (``cDescricaoProduto``), que fica
+errada quando o vínculo do produto foi feito à mão (ex.: "Skirt Steak" no lugar de
+"FRALDA") e/ou quando ``cCodigoProduto`` é o código interno ``PRD...``. Na etapa
+40 (Faturado) o XML da nota já está no serviço DocumentosFiscais, então a
+sincronização baixa o XML com ``ListarDocumentos`` e usa o ``xProd`` do fornecedor:
+
+- a nota é localizada pela chave de acesso (``chave_do_xml``) e cada item pela
+  âncora de identidade — EAN quando existe, senão fornecedor + ``cProd``; o
+  ``PRD...`` interno NUNCA é âncora (a posição na nota só entra como último
+  recurso, quando as duas listas têm o mesmo tamanho);
+- quando o ``xProd`` difere da descrição gravada, ``itens_nota.descricao_produto``
+  passa a ser a do fornecedor, o texto anterior fica em
+  ``descricao_produto_anterior`` e ``descricao_origem`` registra "XML etapa 40";
+- cada mudança vira uma linha em ``itens_auditados`` (chave ``XML_<nota>_<item>``,
+  ``auditado=True``, motivo ``descricao_xml``) com descrição antes/depois, fonte e
+  data/hora — é registro histórico e fica fora do prefixo ``DESC_`` dos relatórios;
+- em 60/80 o texto da listagem serve só de conferência: descrição já igual (ou já
+  vinda do XML) não é reescrita. A memória de-para também passa a guardar a
+  descrição do fornecedor (exceto quando o de-para é ``manual``).
+
 
 Deduplicação: a chave de acesso (44 dígitos) é única em ``notas_fiscais``. Nota
 já gravada é contada como **duplicada** e ignorada (sem tocar nos itens), o que
@@ -68,8 +89,11 @@ Notas canceladas (``infoCadastro.cCancelada="S"``) não entram.
 
 from __future__ import annotations
 
+import html
 import os
 import re
+import time
+import xml.etree.ElementTree as ET
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
@@ -77,6 +101,7 @@ from backend.aprendizado_produtos import (
     aplicar_embalagem_aprendida,
     aplicar_identidade,
     interpretar_embalagem,
+    limpar_entidades_texto,
     normalizar_cnpj,
     normalizar_codigo_produto,
     normalizar_quantidades,
@@ -92,7 +117,12 @@ from backend.models import (
     MapeamentoFornecedorProduto,
     NotaFiscal,
 )
-from backend.omie_client import ErroOmie, OmieClient, OmieNaoConfigurado
+from backend.omie_client import (
+    ErroOmie,
+    OmieClient,
+    OmieNaoConfigurado,
+    chave_do_xml,
+)
 
 # Etapas do kanban do Omie que a importação cobre (ver flags do infoCadastro).
 ETAPAS_SYNC = ("40", "60", "80")
@@ -228,6 +258,22 @@ MOTIVO_REVISAR_VINCULACAO = "revisar_vinculacao"
 PREFIXO_CODIGO_INTERNO_OMIE = "PRD"
 # Quantas divergências o resumo carrega (os contadores são sempre exatos).
 LIMITE_AMOSTRA_DIVERGENCIAS = 20
+# ── Correção da descrição pelo XML da nota (passo 3) ──────────────────────────
+# Motivo gravado em ``itens_auditados`` para cada descrição trocada pelo xProd do
+# XML. A chave do registro começa com ``XML_`` (nunca ``DESC_``), então o mapa de
+# auditoria dos relatórios não a considera: o item continua contando normalmente.
+MOTIVO_DESCRICAO_XML = "descricao_xml"
+PREFIXO_MARCADOR_DESCRICAO = "XML"
+# Etapa em que a nota já tem o XML no serviço DocumentosFiscais (Faturado).
+ETAPA_FATURADO = "40"
+# Prefixo gravado em ``itens_nota.descricao_origem``: o item já foi corrigido por
+# um XML anterior e não pode ser sobrescrito de novo (60/80 só conferem).
+PREFIXO_ORIGEM_XML = "XML"
+# Quantos eventos de correção o resumo carrega (os contadores são sempre exatos).
+LIMITE_AMOSTRA_DESCRICOES = 20
+# Namespace da NF-e (o parse aceita XML com e sem ele).
+NS_NFE = "http://www.portalfiscal.inf.br/nfe"
+
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -253,7 +299,11 @@ def _itens_do_recebimento(recebimento: Dict[str, Any]) -> List[Dict[str, Any]]:
         if not isinstance(ajustes, dict):
             ajustes = {}
 
-        descricao = _texto(cabec.get("cDescricaoProduto") or cabec.get("xProd"))
+        # Entidades HTML/XML são decodificadas na ENTRADA: "&amp; SKIRT STEAK"
+        # vira "& SKIRT STEAK" antes de comparar/gerar a chave do produto.
+        descricao = limpar_entidades_texto(
+            _texto(cabec.get("cDescricaoProduto") or cabec.get("xProd"))
+        )
         if not descricao:
             continue  # sem descrição não há como comparar preço em relatório
         unidade = _texto(
@@ -327,7 +377,10 @@ def _dados_do_recebimento(recebimento: Dict[str, Any]) -> Dict[str, Any]:
         "emissao": emissao,
         "valor": valor,
         "cnpj": normalizar_cnpj(cabec.get("cCNPJ_CPF")),
-        "fornecedor": _texto(cabec.get("cRazaoSocial") or cabec.get("cNome")),
+        # Razão social do fornecedor também entra sem entidade ("&amp;" -> "&").
+        "fornecedor": limpar_entidades_texto(
+            _texto(cabec.get("cRazaoSocial") or cabec.get("cNome"))
+        ),
         "cancelada": _texto(cadastro.get("cCancelada")).upper() == "S",
         "itens": _itens_do_recebimento(recebimento),
     }
@@ -608,6 +661,327 @@ def _sinalizar_divergencias(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Correção da descrição pelo XML da nota (etapa 40)
+# ──────────────────────────────────────────────────────────────────────────────
+def _tag(elemento) -> str:
+    """Nome da tag sem o namespace (``{ns}prod`` -> ``prod``)."""
+    return str(getattr(elemento, "tag", "")).rsplit("}", 1)[-1]
+
+
+def _filho(elemento, nome: str):
+    """Primeiro filho com a tag informada (ignora o namespace), ou ``None``.
+
+    Percorrer os filhos em vez de usar ``find`` com caminho evita depender do
+    prefixo/namespace do emitente: o XML da Omie pode vir como ``nfeProc``, com
+    ``nfe:`` na frente ou sem namespace nenhum (testes e emitentes antigos).
+    """
+    for filho in elemento or ():
+        if _tag(filho) == nome:
+            return filho
+    return None
+
+
+def _texto_filho(elemento, nome: str) -> str:
+    """Texto de um campo do XML sem espaços e sem entidade HTML/XML."""
+    filho = _filho(elemento, nome)
+    if filho is None or not filho.text:
+        return ""
+    return limpar_entidades_texto(filho.text.strip())
+
+
+def _raiz_do_xml(xml: Any):
+    """Raiz do XML a partir do ``cXml`` do Omie (escapado) ou do texto cru.
+
+    O ``cXml`` chega como ``"&lt;?xml ...&gt;"`` (uma camada de escape), então o
+    ``html.unescape`` roda UMA vez — o ``&amp;`` interno do xProd continua sendo
+    entidade do próprio XML e é decodificado pelo ElementTree (por isso a limpeza
+    de ``&amp;amp;`` acontece depois, campo a campo). A declaração de encoding é
+    descartada antes do parse de texto porque o ElementTree recusa ``str`` com
+    ``encoding=`` (ValueError) e o texto aqui já está decodificado.
+    """
+    texto = _texto(xml)
+    if not texto:
+        return None
+    tentativas = [texto]
+    if "&lt;" in texto:  # cXml escapado pelo Omie
+        tentativas.insert(0, html.unescape(texto))
+    for tentativa in tentativas:
+        for conteudo in (
+            tentativa,
+            re.sub(r"^\s*<\?xml[^>]*\?>", "", tentativa, count=1),
+        ):
+            try:
+                return ET.fromstring(conteudo)
+            except (ET.ParseError, ValueError):
+                continue
+    return None
+
+
+def itens_do_xml(xml: Any) -> List[Dict[str, Any]]:
+    """Itens (``det/prod``) do XML da NF-e com os campos já normalizados.
+
+    ``cProd`` é o código do produto NO FORNECEDOR e ``xProd`` a descrição do
+    fornecedor — é o xProd que substitui a descrição errada do cadastro interno
+    do Omie. Os demais campos ficam disponíveis para conferência; o que não
+    existe no XML vem zerado (``""``/``0.0``). XML ilegível devolve ``[]``: a
+    nota é apenas contada como "sem XML", sem derrubar a sincronização.
+    """
+    raiz = _raiz_do_xml(xml)
+    if raiz is None:
+        return []
+    itens: List[Dict[str, Any]] = []
+    for det in raiz.iter():
+        if _tag(det) != "det":
+            continue
+        prod = _filho(det, "prod")
+        if prod is None:
+            continue
+        itens.append(
+            {
+                "c_prod": normalizar_codigo_produto(_texto_filho(prod, "cProd")),
+                "descricao": _texto_filho(prod, "xProd"),
+                "ean": _ean(_texto_filho(prod, "cEAN")),
+                "ncm": _digitos(_texto_filho(prod, "NCM"), 8) or "00000000",
+                "cfop": _digitos(_texto_filho(prod, "CFOP"), 4) or "0000",
+                "unidade": _texto_filho(prod, "uCom"),
+                "quantidade": _numero(_texto_filho(prod, "qCom")),
+                "valor_unitario": _numero(_texto_filho(prod, "vUnCom")),
+                "valor_total": _numero(_texto_filho(prod, "vProd")),
+                "desconto": _numero(_texto_filho(prod, "vDesc")),
+            }
+        )
+    return itens
+
+
+def _codigo_interno(c_prod: Any) -> bool:
+    """True para o código INTERNO do Omie (``PRD00001``) — nunca serve de âncora."""
+    return normalizar_codigo_produto(c_prod).startswith(PREFIXO_CODIGO_INTERNO_OMIE)
+
+
+def _mapa_xml_por_item(
+    itens_xml: List[Dict[str, Any]], itens_recebimento: List[Dict[str, Any]]
+) -> Dict[int, Dict[str, Any]]:
+    """Liga cada item do recebimento (1-based) ao item do XML.
+
+    A ordem das tentativas é a âncora de identidade do projeto:
+
+    1. **EAN** — código de barras é global e identifica o produto mesmo quando o
+       cProd/descrição do cadastro interno estão errados;
+    2. **cProd** — só quando ele é o código do fornecedor (o ``PRD...`` interno
+       nunca é âncora, por definição);
+    3. **posição** — último recurso, apenas quando as duas listas têm o mesmo
+       tamanho (mesma nota, mesma ordem de ``det``). Um par posicional é
+       descartado se os dois lados têm EAN válido e diferente — nesse caso não
+       há garantia de que seja o mesmo produto.
+    """
+    mapa: Dict[int, Dict[str, Any]] = {}
+    usados: Set[int] = set()
+
+    por_ean: Dict[str, List[int]] = {}
+    for posicao, item_xml in enumerate(itens_xml):
+        ean = _texto(item_xml.get("ean"))
+        if _ean_valido(ean):
+            por_ean.setdefault(ean, []).append(posicao)
+    for indice, item in enumerate(itens_recebimento, start=1):
+        ean = _texto(item.get("ean"))
+        if _ean_valido(ean) and por_ean.get(ean):
+            posicao = por_ean[ean].pop(0)
+            mapa[indice] = itens_xml[posicao]
+            usados.add(posicao)
+
+    por_c_prod: Dict[str, List[int]] = {}
+    for posicao, item_xml in enumerate(itens_xml):
+        if posicao in usados:
+            continue
+        c_prod = normalizar_codigo_produto(item_xml.get("c_prod"))
+        if c_prod:
+            por_c_prod.setdefault(c_prod, []).append(posicao)
+    for indice, item in enumerate(itens_recebimento, start=1):
+        if indice in mapa:
+            continue
+        c_prod = normalizar_codigo_produto(item.get("c_prod"))
+        if not c_prod or _codigo_interno(c_prod) or not por_c_prod.get(c_prod):
+            continue
+        posicao = por_c_prod[c_prod].pop(0)
+        mapa[indice] = itens_xml[posicao]
+        usados.add(posicao)
+
+    if len(itens_xml) == len(itens_recebimento):
+        for indice, item in enumerate(itens_recebimento, start=1):
+            if indice in mapa:
+                continue
+            posicao = indice - 1
+            if posicao in usados:
+                continue
+            item_xml = itens_xml[posicao]
+            ean_item = _texto(item.get("ean"))
+            ean_xml = _texto(item_xml.get("ean"))
+            if _ean_valido(ean_item) and _ean_valido(ean_xml) and ean_item != ean_xml:
+                continue
+            mapa[indice] = item_xml
+            usados.add(posicao)
+    return mapa
+
+
+def _parear_itens_gravados(
+    itens_recebimento: List[Dict[str, Any]], itens_gravados: List[ItemNota]
+) -> List[Tuple[int, Dict[str, Any], ItemNota]]:
+    """``[(índice, item do recebimento, ItemNota)]`` na ordem da nota.
+
+    A importação grava os itens não bonificados na ordem de ``itensRecebimento``,
+    então listas do mesmo tamanho casam por posição (exato). Se algo não bateu
+    (nota antiga, item removido), o pareamento cai para EAN e depois cProd: o que
+    não casar fica de fora — melhor não corrigir do que trocar a descrição do
+    produto errado.
+    """
+    candidatos = [
+        (indice, bruto)
+        for indice, bruto in enumerate(itens_recebimento, start=1)
+        if isinstance(bruto, dict) and not _item_bonificado(bruto)
+    ]
+    if len(candidatos) == len(itens_gravados):
+        return [
+            (indice, bruto, item)
+            for (indice, bruto), item in zip(candidatos, itens_gravados)
+        ]
+
+    pares: List[Tuple[int, Dict[str, Any], ItemNota]] = []
+    disponiveis = list(candidatos)
+    for item in itens_gravados:
+        achado = None
+        ean_item = _texto(item.ean)
+        if _ean_valido(ean_item):
+            for posicao, (_indice, bruto) in enumerate(disponiveis):
+                if _texto(bruto.get("ean")) == ean_item:
+                    achado = posicao
+                    break
+        if achado is None:
+            c_prod_item = normalizar_codigo_produto(item.c_prod)
+            for posicao, (_indice, bruto) in enumerate(disponiveis):
+                if c_prod_item and c_prod_item == normalizar_codigo_produto(
+                    bruto.get("c_prod")
+                ):
+                    achado = posicao
+                    break
+        if achado is None:
+            continue
+        indice, bruto = disponiveis.pop(achado)
+        pares.append((indice, bruto, item))
+    return pares
+
+
+class _XmlDasNotas:
+    """XML das NF-e baixado por ``ListarDocumentos`` e indexado pela chave.
+
+    A listagem não aceita filtro por chave de acesso, então o recorte é o período
+    da sincronização: uma única varredura serve todas as notas da execução. Sem
+    período (importação do histórico inteiro), a janela é derivada da data de
+    emissão da nota — notas do mesmo dia compartilham a chamada.
+
+    A carga é **sob demanda** (só quando alguma nota precisa de conferência) e o
+    resultado fica em cache. Falha de API desliga o recurso pelo resto da
+    execução (o XML é acessório: a nota e os itens já foram gravados com os dados
+    da listagem) e o motivo entra em ``avisos``.
+    """
+
+    def __init__(
+        self,
+        cliente,
+        inicio: Optional[date],
+        fim: Optional[date],
+        *,
+        registros_por_pagina: int = REGISTROS_POR_PAGINA,
+        maximo_paginas: int = MAXIMO_PAGINAS,
+        intervalo: float = 0.0,
+    ):
+        self.cliente = cliente
+        self.inicio = inicio
+        self.fim = fim
+        self.registros_por_pagina = max(1, int(registros_por_pagina))
+        self.maximo_paginas = max(1, int(maximo_paginas))
+        self.intervalo = max(0.0, float(intervalo or 0.0))
+        self.consultas = 0
+        self.avisos: List[str] = []
+        self._cache: Dict[Tuple[str, str], Dict[str, str]] = {}
+        # O cliente injetado nos testes pode não ter a listagem de documentos:
+        # nesse caso a conferência do XML é simplesmente desligada (nenhum aviso,
+        # porque o cliente real do Omie sempre expõe ListarDocumentos).
+        self.desativado = not callable(
+            getattr(cliente, "listar_documentos_entrada", None)
+        )
+
+    def _janela(self, emissao: Optional[date]) -> Optional[Tuple[date, date]]:
+        """Período usado no ``ListarDocumentos`` para localizar a nota."""
+        if self.inicio is not None and self.fim is not None:
+            return self.inicio, self.fim
+        if isinstance(emissao, date):
+            return emissao, emissao
+        return None
+
+    def _carregar(self, janela: Tuple[date, date]) -> Dict[str, str]:
+        """Baixa (uma vez) todas as páginas da janela e indexa por chave."""
+        chave_janela = (janela[0].isoformat(), janela[1].isoformat())
+        if chave_janela in self._cache:
+            return self._cache[chave_janela]
+
+        indexado: Dict[str, str] = {}
+        for pagina in range(1, self.maximo_paginas + 1):
+            try:
+                documentos = self.cliente.listar_documentos_entrada(
+                    janela[0],
+                    janela[1],
+                    pagina=pagina,
+                    registros_por_pagina=self.registros_por_pagina,
+                )
+            except (ErroOmie, ValueError, TypeError) as exc:
+                self.desativado = True
+                self.avisos.append(
+                    "XML da nota não conferido (ListarDocumentos "
+                    f"{janela[0]:%d/%m/%Y}..{janela[1]:%d/%m/%Y}): {exc}"
+                )
+                break
+            self.consultas += 1
+            if not documentos:
+                break
+            novos = 0
+            for documento in documentos:
+                if not isinstance(documento, dict):
+                    continue
+                xml = _texto(documento.get("cXml") or documento.get("cXmlNfe"))
+                chave = chave_do_xml(xml) or _digitos(
+                    documento.get("nChave") or documento.get("cChave")
+                )
+                if chave and chave not in indexado:
+                    indexado[chave] = xml
+                    novos += 1
+            # Página incompleta (fim da listagem) ou página repetida (a API
+            # ignorou a paginação): continuar só gastaria chamada.
+            if len(documentos) < self.registros_por_pagina or not novos:
+                break
+            if pagina == self.maximo_paginas:
+                logger.warning(
+                    "Omie ListarDocumentos: limite de %s páginas atingido; "
+                    "alguns XMLs podem não ter sido conferidos.",
+                    self.maximo_paginas,
+                )
+                break
+            if self.intervalo:
+                time.sleep(self.intervalo)
+
+        self._cache[chave_janela] = indexado
+        return indexado
+
+    def xml_da_nota(self, chave: str, emissao: Optional[date] = None) -> str:
+        """``cXml`` da nota (texto cru) ou ``""`` quando não foi possível baixar."""
+        if self.desativado or not _texto(chave):
+            return ""
+        janela = self._janela(emissao)
+        if janela is None:
+            return ""
+        return self._carregar(janela).get(_texto(chave), "")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Credenciais (armazenadas cifradas em empresas.omie_app_key/omie_app_secret)
 # ──────────────────────────────────────────────────────────────────────────────
 def credenciais_da_empresa(empresa) -> Tuple[str, str, str]:
@@ -759,6 +1133,228 @@ def _fornecedor_da_nota(
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Aplicação da correção (descrição do fornecedor x cadastro interno do Omie)
+# ──────────────────────────────────────────────────────────────────────────────
+def _fonte_da_descricao(etapa: Any) -> str:
+    """Rótulo gravado em ``itens_nota.descricao_origem`` e ``itens_auditados.fonte``."""
+    etapa = _texto(etapa)
+    return f"XML etapa {etapa}" if etapa else "XML"
+
+
+def _registrar_correcao_descricao(
+    db,
+    chave: str,
+    indice: int,
+    antes: str,
+    depois: str,
+    fonte: str,
+    resultado: Dict[str, Any],
+) -> None:
+    """Grava a trilha da correção em ``itens_auditados`` (uma linha por item).
+
+    A chave começa com ``XML_`` (nunca ``DESC_``) e ``auditado=True``: é registro
+    histórico, não pendência — o item continua nos relatórios e a Auditoria não
+    precisa aprovar nada. Reexecutar a correção atualiza a mesma linha em vez de
+    criar duplicata.
+    """
+    marcador = f"{PREFIXO_MARCADOR_DESCRICAO}_{chave}_{indice}"
+    registro = (
+        db.query(ItemAuditado)
+        .filter(ItemAuditado.chave_identificacao == marcador)
+        .first()
+    )
+    if registro is None:
+        registro = ItemAuditado(
+            chave_identificacao=marcador,
+            auditado=True,
+            motivo=MOTIVO_DESCRICAO_XML,
+        )
+        db.add(registro)
+        resultado["descricoes"]["marcadores"] += 1
+    registro.descricao_antes = antes or None
+    registro.descricao_depois = depois or None
+    registro.fonte = fonte
+    registro.registrado_em = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _atualizar_memoria_descricao(mapa_aprendizado, cnpj, c_prod, descricao) -> bool:
+    """Grava a descrição do fornecedor na memória de-para (nunca se for ``manual``).
+
+    Sem isso a próxima nota do mesmo fornecedor+cProd voltaria com a descrição
+    errada: ``aplicar_identidade`` usa a memória como texto canônico. A correção
+    manual feita na Auditoria vence a automática (``origem="manual"``).
+    """
+    chave = (normalizar_cnpj(cnpj), normalizar_codigo_produto(c_prod))
+    mapeamento = (mapa_aprendizado or {}).get(chave)
+    if mapeamento is None or not _texto(descricao):
+        return False
+    if str(getattr(mapeamento, "origem", "") or "").strip().lower() == "manual":
+        return False
+    if _mesmo_texto(getattr(mapeamento, "descricao_padrao", ""), descricao):
+        return False
+    mapeamento.descricao_padrao = descricao
+    mapeamento.atualizado_em = datetime.now(timezone.utc).isoformat(
+        timespec="seconds"
+    )
+    return True
+
+
+def _tem_marcador_pendente(db, chave: str) -> bool:
+    """True quando a nota já tem pendência ``DIV_``/``VINC_`` registrada."""
+    if not _texto(chave):
+        return False
+    filtro = ItemAuditado.chave_identificacao.like(f"DIV_{chave}_%") | (
+        ItemAuditado.chave_identificacao.like(f"VINC_{chave}_%")
+    )
+    return db.query(ItemAuditado.id).filter(filtro).first() is not None
+
+
+def _conferir_xml_na_importacao(
+    etapa: Any, itens_recebimento: List[Dict[str, Any]], sinalizado: bool
+) -> bool:
+    """True quando a nota NOVA deve ser conferida contra o XML.
+
+    Na etapa 40 (Faturado) o XML está disponível para todas as notas e a
+    conferência é o padrão. Em 60/80 só as notas com divergência sinalizada ou
+    com código interno ``PRD...`` são conferidas.
+    """
+    if _texto(etapa) == ETAPA_FATURADO:
+        return True
+    if sinalizado:
+        return True
+    return any(_codigo_interno(item.get("c_prod")) for item in itens_recebimento)
+
+
+def _corrigir_descricoes_da_nota(
+    db,
+    chave: str,
+    etapa: Any,
+    itens_recebimento: List[Dict[str, Any]],
+    pares: List[Tuple[int, Dict[str, Any], ItemNota]],
+    xml: Any,
+    cnpj: str,
+    mapa_aprendizado,
+    resultado: Dict[str, Any],
+) -> int:
+    """Aplica o ``xProd`` do XML nos itens com descrição divergente.
+
+    Regras:
+    - item do XML localizado pela âncora (EAN, depois cProd; o ``PRD...`` interno
+      nunca é âncora) — ver :func:`_mapa_xml_por_item`;
+    - descrição já igual à do XML (comparação normalizada) não é reescrita;
+    - item cuja descrição já veio do XML (``descricao_origem``) não é reescrito de
+      novo: em 60/80 o texto da listagem serve só de conferência;
+    - o texto anterior fica em ``itens_nota.descricao_produto_anterior`` e cada
+      mudança vira uma linha em ``itens_auditados`` (antes -> depois, fonte e
+      data/hora);
+    - a memória de-para acompanha (exceto a ``manual``), para o mesmo
+      fornecedor+cProd não voltar com a descrição errada.
+
+    Devolve quantos itens foram corrigidos.
+    """
+    itens_xml = itens_do_xml(xml)
+    if not itens_xml:
+        resultado["descricoes"]["sem_xml"] += 1
+        return 0
+    resultado["descricoes"]["xmls_lidos"] += 1
+    mapa = _mapa_xml_por_item(itens_xml, itens_recebimento)
+    fonte = _fonte_da_descricao(etapa)
+    corrigidos = 0
+    for indice, bruto, item in pares:
+        nova = _texto((mapa.get(indice) or {}).get("descricao"))
+        if not nova:
+            resultado["descricoes"]["nao_encontrados"] += 1
+            continue
+        atual = _texto(item.descricao_produto)
+        if _mesmo_texto(nova, atual):
+            # Já está com a descrição do fornecedor: nada muda (no 60/80 o texto
+            # da API é só conferência).
+            resultado["descricoes"]["conferidas"] += 1
+            continue
+        if _texto(getattr(item, "descricao_origem", "")).startswith(
+            PREFIXO_ORIGEM_XML
+        ):
+            resultado["descricoes"]["mantidas"] += 1
+            continue
+        item.descricao_produto = nova
+        if not _texto(getattr(item, "descricao_produto_anterior", "")):
+            item.descricao_produto_anterior = atual or None
+        item.descricao_origem = fonte
+        _registrar_correcao_descricao(
+            db, chave, indice, atual, nova, fonte, resultado
+        )
+        if _atualizar_memoria_descricao(
+            mapa_aprendizado, cnpj, bruto.get("c_prod"), nova
+        ):
+            resultado["descricoes"]["memoria_atualizada"] += 1
+        resultado["descricoes"]["corrigidas"] += 1
+        if len(resultado["descricoes"]["eventos"]) < LIMITE_AMOSTRA_DESCRICOES:
+            resultado["descricoes"]["eventos"].append(
+                {
+                    "chave": chave,
+                    "item": indice,
+                    "c_prod": _texto(bruto.get("c_prod")),
+                    "ean": _texto(bruto.get("ean")),
+                    "antes": atual,
+                    "depois": nova,
+                    "fonte": fonte,
+                }
+            )
+        corrigidos += 1
+    return corrigidos
+
+
+def _corrigir_nota_existente(
+    db,
+    nota: NotaFiscal,
+    dados: Dict[str, Any],
+    etapa: Any,
+    xmls: "_XmlDasNotas",
+    mapa_aprendizado,
+    resultado: Dict[str, Any],
+) -> int:
+    """Corrige a descrição de uma nota JÁ importada (reexecução da sincronização).
+
+    A deduplicação por chave mantém a nota intacta; a exceção é a correção de
+    descrição. Baixar o XML de toda nota repetida a cada execução seria caro e sem
+    efeito, então só entram as notas com código interno ``PRD...`` nos itens ou com
+    pendência DIV_/VINC_ já sinalizada — exatamente as que precisam de conserto.
+    """
+    itens = (
+        db.query(ItemNota)
+        .filter(ItemNota.nota_id == nota.id)
+        .order_by(ItemNota.id)
+        .all()
+    )
+    if not itens:
+        return 0
+    itens_recebimento = dados.get("itens") or []
+    precisa = any(_codigo_interno(item.c_prod) for item in itens) or any(
+        _codigo_interno(item.get("c_prod")) for item in itens_recebimento
+    )
+    if not precisa and not _tem_marcador_pendente(db, dados["chave"]):
+        return 0
+    xml = xmls.xml_da_nota(dados["chave"], dados.get("emissao"))
+    if not xml:
+        resultado["descricoes"]["sem_xml"] += 1
+        return 0
+    pares = _parear_itens_gravados(itens_recebimento, itens)
+    if not pares:
+        return 0
+    return _corrigir_descricoes_da_nota(
+        db,
+        dados["chave"],
+        etapa,
+        itens_recebimento,
+        pares,
+        xml,
+        dados.get("cnpj", ""),
+        mapa_aprendizado,
+        resultado,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Importação de um recebimento
 # ──────────────────────────────────────────────────────────────────────────────
 def _importar_recebimento(
@@ -772,6 +1368,9 @@ def _importar_recebimento(
     historico: _HistoricoIdentidade,
     confirmar: bool,
     notas_novas: List[int],
+    etapa: Any,
+    xmls: "_XmlDasNotas",
+    corrigir_descricoes_xml: bool = True,
 ) -> str:
     """Grava UM recebimento (cabeçalho + itens) e devolve o contador afetado.
 
@@ -788,6 +1387,12 @@ def _importar_recebimento(
     histórico por :func:`_sinalizar_divergencias`: divergência de descrição/
     cProd na mesma âncora e código interno ``PRD...`` viram pendências na
     Auditoria. A identidade gravada NÃO muda por causa disso.
+
+    Depois de gravar os itens, a nota é conferida contra o XML da NF-e
+    (``xmls``): na etapa 40 sempre, em 60/80 só quando há divergência/``PRD``.
+    A descrição divergente vira o ``xProd`` do fornecedor (ver
+    :func:`_corrigir_descricoes_da_nota`). Nota já existente (dedupe) também
+    passa pela conferência por :func:`_corrigir_nota_existente`.
     """
     dados = _dados_do_recebimento(recebimento)
 
@@ -807,12 +1412,25 @@ def _importar_recebimento(
     if dados["cancelada"]:
         return "canceladas"
 
-    existe = (
-        db.query(NotaFiscal.id)
+    existente = (
+        db.query(NotaFiscal)
         .filter(NotaFiscal.chave_acesso == dados["chave"])
         .first()
     )
-    if existe:
+    if existente is not None:
+        if corrigir_descricoes_xml:
+            _corrigir_nota_existente(
+                db,
+                existente,
+                dados,
+                etapa,
+                xmls,
+                mapa_aprendizado,
+                resultado,
+            )
+            # A correção mexe em linha já gravada: persiste já (ou fica pendente no
+            # modo simulação, como todo o resto).
+            _commit(db, confirmar)
         return "duplicadas"
 
     if dados["emissao"] is None:
@@ -840,6 +1458,8 @@ def _importar_recebimento(
 
     itens_gravados = 0
     nota_sinalizada = False
+    # (índice na nota, item do recebimento, linha gravada) — base da conferência XML.
+    pares: List[Tuple[int, Dict[str, Any], ItemNota]] = []
     for indice, bruto in enumerate(dados["itens"], start=1):
         if _item_bonificado(bruto):
             resultado["bonificados"] += 1
@@ -868,7 +1488,11 @@ def _importar_recebimento(
             )
             mapeamento = mapa_aprendizado.get(chave_aprendizado)
 
-        ean_xml, desc_xml, ncm_xml = bruto["ean"], bruto["descricao"], bruto["ncm"]
+        # A descrição do XML do Omie também passa pela limpeza (a mesma aplicada
+        # na leitura do item), para a identidade e a memória nunca guardarem "&amp;".
+        ean_xml = bruto["ean"]
+        desc_xml = limpar_entidades_texto(bruto["descricao"])
+        ncm_xml = bruto["ncm"]
         ean, desc, ncm = ean_xml, desc_xml, ncm_xml
         if mapeamento is not None:
             resultado["mapeamentos_usados"] += 1
@@ -898,26 +1522,51 @@ def _importar_recebimento(
 
         # Valores CRUS do Omie nas colunas principais (auditoria/reprocessamento);
         # as conversões ficam em *_base, exatamente como no importador de XML.
-        db.add(
-            ItemNota(
-                nota_id=nota.id,
-                fornecedor_id=fornecedor.id if fornecedor is not None else None,
-                ean=ean,
-                descricao_produto=desc,
-                quantidade=bruto["quantidade"],
-                valor_unitario=bruto["valor_unitario"],
-                valor_total=bruto["valor_total"],
-                ncm=ncm or "00000000",
-                cfop=bruto["cfop"] or "0000",
-                c_prod=bruto["c_prod"] or None,
-                unidade_compra=bruto["unidade"] or None,
-                qtd_por_embalagem=float(embalagem.get("qtd_por_embalagem") or 1.0),
-                unidade_base=str(embalagem.get("unidade_base") or "UN"),
-                quantidade_base=quantidade_base,
-                valor_unitario_base=valor_unitario_base,
-            )
+        item_gravado = ItemNota(
+            nota_id=nota.id,
+            fornecedor_id=fornecedor.id if fornecedor is not None else None,
+            ean=ean,
+            descricao_produto=desc,
+            quantidade=bruto["quantidade"],
+            valor_unitario=bruto["valor_unitario"],
+            valor_total=bruto["valor_total"],
+            ncm=ncm or "00000000",
+            cfop=bruto["cfop"] or "0000",
+            c_prod=bruto["c_prod"] or None,
+            unidade_compra=bruto["unidade"] or None,
+            qtd_por_embalagem=float(embalagem.get("qtd_por_embalagem") or 1.0),
+            unidade_base=str(embalagem.get("unidade_base") or "UN"),
+            quantidade_base=quantidade_base,
+            valor_unitario_base=valor_unitario_base,
         )
+        db.add(item_gravado)
+        pares.append((indice, bruto, item_gravado))
         itens_gravados += 1
+
+    # ── Conferência contra o XML da nota (passo 3) ────────────────────────────
+    # Roda depois de os itens existirem (a linha é atualizada, não recriada) e
+    # antes do commit final. Sem XML, com XML ilegível ou quando a nota não
+    # precisa de conferência, o resumo apenas conta — nada muda no item.
+    if (
+        corrigir_descricoes_xml
+        and pares
+        and _conferir_xml_na_importacao(etapa, dados["itens"], nota_sinalizada)
+    ):
+        xml = xmls.xml_da_nota(dados["chave"], dados["emissao"])
+        if xml:
+            _corrigir_descricoes_da_nota(
+                db,
+                dados["chave"],
+                etapa,
+                dados["itens"],
+                pares,
+                xml,
+                dados["cnpj"],
+                mapa_aprendizado,
+                resultado,
+            )
+        else:
+            resultado["descricoes"]["sem_xml"] += 1
 
     _commit(db, confirmar)
     resultado["itens"] += itens_gravados
@@ -960,6 +1609,7 @@ def sincronizar_recebimentos(
     confirmar: bool = True,
     recalcular_marcas_itens: bool = True,
     atualizar_sync_em: bool = True,
+    corrigir_descricoes_xml: bool = True,
 ) -> Dict[str, Any]:
     """Sincroniza os recebimentos do Omie de UMA loja com o banco.
 
@@ -988,6 +1638,11 @@ def sincronizar_recebimentos(
         recalcular_marcas_itens: recalcula ``itens_nota.marca`` pelo cache local
             quando entrou nota nova (mesma etapa do importador de XML).
         atualizar_sync_em: grava ``empresas.omie_sync_em`` no fim.
+        corrigir_descricoes_xml: confere a descrição dos itens contra o ``xProd``
+            do XML da nota (``ListarDocumentos``). Na etapa 40 vale para toda nota
+            nova; em 60/80 e nas notas já gravadas, só para as que têm
+            divergência sinalizada ou código interno ``PRD...``. ``False`` desliga
+            a chamada extra à API (usado por scripts/diagnósticos).
 
     Returns:
         Dict com os contadores da execução: ``novas``, ``duplicadas``,
@@ -998,9 +1653,12 @@ def sincronizar_recebimentos(
         importadas que ficaram sem marca), ``divergencias`` (itens sinalizados
         para revisão: ``total``, ``notas``, ``divergencia_produto``,
         ``revisar_vinculacao``, ``marcadores`` e a amostra ``itens``),
-        ``avisos`` (lista legível de avisos,
-        ex.: itens sem marca), ``erros`` (lista legível), ``periodo``,
-        ``origem_credenciais`` e ``simulado``.
+        ``descricoes`` (correção pelo XML: ``corrigidas``, ``conferidas``,
+        ``mantidas``, ``sem_xml``, ``xmls_lidos``, ``nao_encontrados``,
+        ``marcadores``, ``memoria_atualizada``, ``consultas`` e a amostra
+        ``eventos``), ``avisos`` (lista legível de avisos,
+        ex.: itens sem marca, XML indisponível), ``erros`` (lista legível),
+        ``periodo``, ``origem_credenciais`` e ``simulado``.
 
     Raises:
         ErroSincronizacao: empresa/período/etapa inválidos.
@@ -1064,6 +1722,22 @@ def sincronizar_recebimentos(
             "marcadores": 0,
             "itens": [],
         },
+        # Correção da descrição pelo XML (passo 3). ``corrigidas`` conta itens
+        # reescritos; ``conferidas`` os que já estavam iguais ao xProd;
+        # ``mantidas`` os que já tinham vindo de um XML anterior (60/80 só
+        # conferem); ``sem_xml`` as notas cujo XML não foi baixado.
+        "descricoes": {
+            "corrigidas": 0,
+            "conferidas": 0,
+            "mantidas": 0,
+            "sem_xml": 0,
+            "xmls_lidos": 0,
+            "nao_encontrados": 0,
+            "marcadores": 0,
+            "memoria_atualizada": 0,
+            "consultas": 0,
+            "eventos": [],
+        },
         "avisos": [],
         "erros": [],
         "origem_credenciais": origem_credenciais,
@@ -1082,6 +1756,16 @@ def sincronizar_recebimentos(
     }
     # Índices de identidade para a sinalização de divergências (só leitura).
     historico = _HistoricoIdentidade(db, mapa_aprendizado)
+    # XML das notas (ListarDocumentos): baixado sob demanda e uma vez por período,
+    # para conferir/corrigir a descrição do produto na etapa 40.
+    xmls = _XmlDasNotas(
+        cliente,
+        inicio,
+        fim,
+        registros_por_pagina=registros_por_pagina,
+        maximo_paginas=maximo_paginas,
+        intervalo=intervalo,
+    )
 
     for etapa in etapas_limpas:
         rotulo = NOME_ETAPA.get(etapa, etapa)
@@ -1123,6 +1807,9 @@ def sincronizar_recebimentos(
                     historico,
                     confirmar,
                     notas_novas,
+                    etapa,
+                    xmls,
+                    corrigir_descricoes_xml,
                 )
             except Exception as exc:  # noqa: BLE001 - uma nota não derruba a importação
                 db.rollback()
@@ -1138,7 +1825,12 @@ def sincronizar_recebimentos(
             resultado[contador] += 1
 
     if confirmar:
-        if resultado["novas"] and recalcular_marcas_itens:
+        # A marca entra na chave do grupo dos relatórios e depende da descrição:
+        # recalculada quando entrou nota nova OU quando alguma descrição foi
+        # corrigida pelo XML (a marca do item corrigido pode ter mudado).
+        if (
+            resultado["novas"] or resultado["descricoes"]["corrigidas"]
+        ) and recalcular_marcas_itens:
             try:
                 resultado["marcas"] = recalcular_marcas(db, apenas_cache=True)
             except Exception as exc:  # noqa: BLE001 - marca é acessório do relatório
@@ -1163,5 +1855,10 @@ def sincronizar_recebimentos(
     else:
         # Modo simulação: nada do que foi gravado/flushado permanece no banco.
         db.rollback()
+
+    # XML da nota: o que foi consultado e qualquer falha na listagem (a nota em
+    # si já está gravada — o XML é acessório e não invalida a sincronização).
+    resultado["descricoes"]["consultas"] = xmls.consultas
+    resultado["avisos"].extend(xmls.avisos)
 
     return resultado

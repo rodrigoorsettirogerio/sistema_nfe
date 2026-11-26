@@ -168,6 +168,14 @@ def _imprimir_resultado(resultado: dict) -> None:
         f"bonificados/doação ignorados: {resultado['bonificados']} | "
         f"notas sem itens: {resultado['notas_sem_itens']}"
     )
+    descricoes = resultado.get("descricoes") or {}
+    if descricoes.get("corrigidas") or descricoes.get("conferidas"):
+        print(
+            f"✏️  Descrição pelo XML da nota: {descricoes.get('corrigidas', 0)} "
+            f"corrigida(s), {descricoes.get('conferidas', 0)} já correta(s), "
+            f"{descricoes.get('sem_xml', 0)} nota(s) sem XML | "
+            f"{descricoes.get('consultas', 0)} consulta(s) ListarDocumentos"
+        )
     print(
         f"🏭 Fornecedores: {resultado['fornecedores_novos']} novo(s), "
         f"{resultado['fornecedores_atualizados']} atualizado(s) | "

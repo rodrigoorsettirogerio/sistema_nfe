@@ -21,12 +21,24 @@ Prova, SEM chamar a API e SEM tocar na base real (banco SQLite temporário):
    (motivos ``divergencia_produto``/``revisar_vinculacao``) sem alterar a
    identidade do item: mesma âncora (EAN ou fornecedor+cProd) com descrição/
    cProd diferente é marcada, código ``PRD...`` pede revisão de vinculação e o
-   resumo ``divergencias`` conta notas/itens.
+   resumo ``divergencias`` conta notas/itens;
+10. as entidades HTML/XML do Omie são decodificadas na ENTRADA
+    (``"&amp; SKIRT STEAK"`` -> ``"& SKIRT STEAK"``), inclusive na razão social do
+    fornecedor, sem tocar em ``&`` que faz parte do texto;
+11. o ``cXml`` da nota (HTML-escapado) é lido e o parse devolve cProd/xProd por
+    item (``itens_do_xml``), com namespace, sem namespace e com ``&amp;amp;``;
+12. a descrição do cadastro interno do Omie é corrigida pelo xProd do XML na
+    etapa 40: ``descricao_produto`` passa a ser a do fornecedor, o texto antigo
+    fica em ``descricao_produto_anterior``, a trilha vai para ``itens_auditados``
+    (antes -> depois, fonte "XML etapa 40", data/hora), a memória de-para é
+    atualizada e nota com descrição já correta NÃO muda (nem a nota já gravada,
+    quando o XML chega numa execução seguinte).
 
 Uso (na raiz do projeto):
     python tests/test_omie_sync.py
 """
 
+import html
 import os
 import sys
 import tempfile
@@ -61,6 +73,10 @@ CHAVE_PROD_NOVO = "45261107876067000567550010000022222000022222"
 CHAVE_PROD_DIVERGENTE = "46261107876067000567550010000033333000033333"
 CHAVE_LIMPA = "47261107876067000567550010000044444000044444"
 CHAVE_LIMPA_2 = "48261107876067000567550010000055555000055555"
+# Notas do bloco de correção da descrição pelo XML (passo 3).
+CHAVE_XML_CORRIGIDA = "49261107876067000567550010000066666000066666"
+CHAVE_XML_CONFERIDA = "50261107876067000567550010000077777000077777"
+CHAVE_XML_EXISTENTE = "52261107876067000567550010000088888000088888"
 CNPJ = "04.559.938/0001-05"
 CNPJ_DIGITOS = "04559938000105"
 CHAVE_CRIPTO = "segredo-de-teste-omie-0123456789abcdef"
@@ -131,11 +147,18 @@ def _recebimento(chave=CHAVE, numero="000095890", cancelada=False, itens=None, v
 
 
 class ClienteFalso:
-    """``OmieClient`` de mentira: devolve os lotes por etapa e registra a chamada."""
+    """``OmieClient`` de mentira: devolve os lotes por etapa e registra a chamada.
 
-    def __init__(self, lotes=None):
+    ``documentos`` alimenta o ``ListarDocumentos`` (XML das notas) da mesma
+    forma: é uma lista fixa devolvida na página 1 (as demais vêm vazias, que é
+    o critério de parada da varredura).
+    """
+
+    def __init__(self, lotes=None, documentos=None):
         self.lotes = lotes or {}
+        self.documentos = list(documentos or [])
         self.chamadas = []
+        self.chamadas_documentos = []
 
     def listar_todos_recebimentos(
         self,
@@ -158,6 +181,166 @@ class ClienteFalso:
         )
         return list(self.lotes.get(etapa, []))
 
+    def listar_documentos_entrada(
+        self,
+        data_inicio,
+        data_fim,
+        pagina=1,
+        registros_por_pagina=50,
+    ):
+        """Página de ``ListarDocumentos`` (XML completo em ``cXml``)."""
+        self.chamadas_documentos.append(
+            {
+                "inicio": data_inicio,
+                "fim": data_fim,
+                "pagina": pagina,
+                "por_pagina": registros_por_pagina,
+            }
+        )
+        return list(self.documentos) if pagina == 1 else []
+
+
+def _xml_nota(chave, itens):
+    """XML mínimo de NF-e (``nfeProc``, com namespace) para o teste do parse.
+
+    ``itens`` é uma lista de dicionários com ``c_prod``/``xprod`` e, opcional,
+    ``ean``/``ncm``/``cfop``/``unidade``/``quantidade``/``preco``/``total``. O
+    texto do xProd é gravado como veio (o teste usa ``&amp;``/``&amp;amp;`` para
+    conferir a decodificação).
+    """
+    dets = "".join(
+        "<det nItem=\"{posicao}\"><prod>"
+        "<cProd>{c_prod}</cProd>"
+        "<cEAN>{ean}</cEAN>"
+        "<xProd>{xprod}</xProd>"
+        "<NCM>{ncm}</NCM>"
+        "<CFOP>{cfop}</CFOP>"
+        "<uCom>{unidade}</uCom>"
+        "<qCom>{quantidade}</qCom>"
+        "<vUnCom>{preco}</vUnCom>"
+        "<vProd>{total}</vProd>"
+        "</prod></det>".format(
+            posicao=posicao,
+            c_prod=item.get("c_prod", ""),
+            ean=item.get("ean") or "SEM GTIN",
+            xprod=item["xprod"],
+            ncm=item.get("ncm", "04061010"),
+            cfop=item.get("cfop", "6101"),
+            unidade=item.get("unidade", "KG"),
+            quantidade=item.get("quantidade", "1.0000"),
+            preco=item.get("preco", "10.00"),
+            total=item.get("total", "10.00"),
+        )
+        for posicao, item in enumerate(itens, start=1)
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<nfeProc xmlns="http://www.portalfiscal.inf.br/nfe">'
+        f'<NFe><infNFe Id="NFe{chave}" versao="4.00">{dets}</infNFe></NFe>'
+        "</nfeProc>"
+    )
+
+
+def _documento_omie(chave, itens):
+    """Documento de ``ListarDocumentos`` como o Omie devolve (``cXml`` escapado)."""
+    return {"nChave": chave, "cXml": html.escape(_xml_nota(chave, itens))}
+
+
+
+
+def _checar_entidades_html():
+    """Texto do Omie entra SEM entidade HTML/XML (``&amp;`` -> ``&``).
+
+    O Omie devolve o texto escapado; sem a limpeza na ENTRADA o "&amp;" vira parte
+    do nome do produto e o resíduo "AMP" podia ser lido como marca. A decodificação
+    é a mesma função usada pelo importador de XML (`limpar_entidades_texto`).
+    """
+    from backend.aprendizado_produtos import limpar_entidades_texto
+
+    _conferir(
+        limpar_entidades_texto("&amp; Skirt Steak") == "& Skirt Steak",
+        '"&amp; Skirt Steak" vira "& Skirt Steak"',
+    )
+    _conferir(
+        limpar_entidades_texto("&amp;amp;") == "&",
+        '"&amp;amp;" vira "&" (decodifica em laço até estabilizar)',
+    )
+    _conferir(
+        limpar_entidades_texto("PEITO & FRANGO") == "PEITO & FRANGO",
+        '"&" comum da descrição continua "&" (a guarda não mexe)',
+    )
+
+    itens = bsync._itens_do_recebimento(
+        _recebimento(itens=[_item(descricao="&amp; SKIRT STEAK")])
+    )
+    _conferir(
+        bool(itens) and itens[0]["descricao"] == "& SKIRT STEAK",
+        "cDescricaoProduto (&amp; SKIRT STEAK) entra no item já decodificado",
+    )
+    recebimento = _recebimento()
+    recebimento["cabec"]["cRazaoSocial"] = "ATACADAO &amp; CIA LTDA"
+    dados = bsync._dados_do_recebimento(recebimento)
+    _conferir(
+        dados["fornecedor"] == "ATACADAO & CIA LTDA",
+        "cRazaoSocial do fornecedor entra decodificada",
+    )
+
+
+def _checar_itens_do_xml():
+    """``itens_do_xml`` lê o ``cXml`` escapado e devolve cProd/xProd por item.
+
+    O XML chega HTML-escapado no ``cXml`` (uma camada) e o xProd pode ter mais
+    uma (``&amp;amp;``); as duas precisam sair limpas. O teste também cobre XML
+    sem namespace e XML ilegível (``[]``, sem exceção).
+    """
+    xml = _xml_nota(
+        CHAVE_XML_CORRIGIDA,
+        [
+            {
+                "c_prod": "FRALDA123",
+                "xprod": "FRALDA GERIATRICA &amp; CONFORT",
+                "ean": "7898925798118",
+                "ncm": "9619.00.00",
+                "cfop": "6.102",
+            },
+            {
+                "c_prod": "DUP-01",
+                "xprod": "FRALDA &amp;amp; CONFORT PLUS",
+                "ean": "SEM GTIN",
+            },
+        ],
+    )
+    itens = bsync.itens_do_xml(html.escape(xml))
+    _conferir(
+        len(itens) == 2
+        and itens[0]["c_prod"] == "FRALDA123"
+        and itens[0]["descricao"] == "FRALDA GERIATRICA & CONFORT",
+        "itens_do_xml: cXml escapado devolve cProd/xProd do item 1 (&amp; -> &)",
+    )
+    _conferir(
+        itens[0]["ean"] == "7898925798118"
+        and itens[0]["ncm"] == "96190000"
+        and itens[0]["cfop"] == "6102",
+        "itens_do_xml: EAN/NCM/CFOP normalizados como no importador de XML",
+    )
+    _conferir(
+        itens[1]["descricao"] == "FRALDA & CONFORT PLUS"
+        and itens[1]["ean"] == "SEM_EAN",
+        "itens_do_xml: &amp;amp; decodifica até o & final e SEM GTIN vira SEM_EAN",
+    )
+    sem_namespace = _xml_nota(
+        CHAVE_XML_CONFERIDA, [{"c_prod": "X1", "xprod": "ACUCAR REFINADO"}]
+    ).replace(' xmlns="http://www.portalfiscal.inf.br/nfe"', "")
+    _conferir(
+        [item["descricao"] for item in bsync.itens_do_xml(sem_namespace)]
+        == ["ACUCAR REFINADO"],
+        "itens_do_xml: XML sem namespace também é lido",
+    )
+    _conferir(
+        bsync.itens_do_xml("<html>erro</html>") == []
+        and bsync.itens_do_xml("") == [],
+        "itens_do_xml: XML ilegível/vazio devolve [] (não derruba a importação)",
+    )
 
 
 def main():
@@ -172,6 +355,12 @@ def main():
     os.environ["OMIE_APP_SECRET"] = "APP-SECRET-DO-AMBIENTE"
 
     try:
+        print("=" * 78)
+        print("0) ENTIDADES HTML/XML — o texto do Omie entra limpo (&amp; -> &)")
+        print("=" * 78)
+        _checar_entidades_html()
+        _checar_itens_do_xml()
+
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as diretorio:
             arquivo = Path(diretorio) / "omie_sync_teste.db"
             engine = create_engine(
@@ -189,6 +378,21 @@ def main():
             with engine.begin() as conexao:
                 for coluna in ("omie_app_key", "omie_app_secret", "omie_sync_em"):
                     conexao.exec_driver_sql(f"ALTER TABLE empresas DROP COLUMN {coluna}")
+                # Colunas da correção de descrição pelo XML (passo 3) também nascem
+                # numa base antiga — o DROP só toca colunas recém-criadas.
+                for coluna in ("descricao_produto_anterior", "descricao_origem"):
+                    conexao.exec_driver_sql(
+                        f"ALTER TABLE itens_nota DROP COLUMN {coluna}"
+                    )
+                for coluna in (
+                    "descricao_antes",
+                    "descricao_depois",
+                    "fonte",
+                    "registrado_em",
+                ):
+                    conexao.exec_driver_sql(
+                        f"ALTER TABLE itens_auditados DROP COLUMN {coluna}"
+                    )
             _conferir(
                 "omie_app_key" not in _colunas(engine, "empresas"),
                 "a base antiga começa sem empresas.omie_app_key",
@@ -198,6 +402,18 @@ def main():
             _conferir(
                 {"omie_app_key", "omie_app_secret", "omie_sync_em"} <= colunas,
                 "init_db criou omie_app_key, omie_app_secret e omie_sync_em",
+            )
+            _conferir(
+                {"descricao_produto_anterior", "descricao_origem"}
+                <= _colunas(engine, "itens_nota")
+                and {
+                    "descricao_antes",
+                    "descricao_depois",
+                    "fonte",
+                    "registrado_em",
+                }
+                <= _colunas(engine, "itens_auditados"),
+                "init_db criou as colunas da correção de descrição pelo XML",
             )
             bd.init_db(engine)
             _conferir(
@@ -690,7 +906,270 @@ def main():
 
             print()
             print("=" * 78)
-            print("7) CLI — --sem-marcas só é aceito junto de --simular")
+            print("7) XML DA NOTA — descrição do fornecedor corrigida na etapa 40")
+            print("=" * 78)
+            # A listagem traz a descrição do CADASTRO interno ("SKIRT STEAK") e o
+            # código interno PRD...; o XML da nota traz cProd/xProd do fornecedor.
+            cliente_xml = ClienteFalso(
+                {
+                    "40": [
+                        _recebimento(
+                            chave=CHAVE_XML_CORRIGIDA,
+                            numero="000006666",
+                            valor=120.0,
+                            itens=[
+                                _item(
+                                    codigo="PRD00050",
+                                    descricao="SKIRT STEAK",
+                                    ean="7898925798118",
+                                    ncm="9619.00.00",
+                                    cfop="6.102",
+                                    unidade="UN",
+                                    quantidade=2.0,
+                                    preco=60.0,
+                                    total=120.0,
+                                )
+                            ],
+                        )
+                    ]
+                },
+                documentos=[
+                    _documento_omie(
+                        CHAVE_XML_CORRIGIDA,
+                        [
+                            {
+                                "c_prod": "FRALDA123",
+                                "xprod": "FRALDA GERIATRICA &amp; CONFORT",
+                                "ean": "7898925798118",
+                                "ncm": "9619.00.00",
+                                "cfop": "6.102",
+                                "unidade": "UN",
+                            }
+                        ],
+                    )
+                ],
+            )
+            corrigida = bsync.sincronizar_recebimentos(
+                db, empresa, dias=7, cliente=cliente_xml, intervalo=0.0
+            )
+            _conferir(
+                corrigida["novas"] == 1
+                and corrigida["descricoes"]["corrigidas"] == 1
+                and corrigida["descricoes"]["xmls_lidos"] == 1,
+                "nota nova na etapa 40: 1 descrição corrigida pelo xProd do XML "
+                f"({corrigida['descricoes']})",
+            )
+            _conferir(
+                len(cliente_xml.chamadas_documentos) == 1,
+                "ListarDocumentos foi chamado uma única vez para o período inteiro",
+            )
+
+            nota_corrigida = (
+                db.query(NotaFiscal)
+                .filter(NotaFiscal.chave_acesso == CHAVE_XML_CORRIGIDA)
+                .one()
+            )
+            item_corrigido = (
+                db.query(ItemNota).filter(ItemNota.nota_id == nota_corrigida.id).one()
+            )
+            _conferir(
+                item_corrigido.descricao_produto == "FRALDA GERIATRICA & CONFORT"
+                and item_corrigido.descricao_produto_anterior == "SKIRT STEAK"
+                and item_corrigido.descricao_origem == "XML etapa 40",
+                "item fica com a descrição do fornecedor e preserva a anterior",
+            )
+            _conferir(
+                item_corrigido.ean == "7898925798118"
+                and item_corrigido.c_prod == "PRD00050",
+                "a correção não mexe na identidade (EAN/cProd continuam os do Omie)",
+            )
+            marcador_xml = (
+                db.query(ItemAuditado)
+                .filter(
+                    ItemAuditado.chave_identificacao
+                    == f"XML_{CHAVE_XML_CORRIGIDA}_1"
+                )
+                .one()
+            )
+            _conferir(
+                marcador_xml.motivo == bsync.MOTIVO_DESCRICAO_XML
+                and marcador_xml.auditado is True
+                and marcador_xml.descricao_antes == "SKIRT STEAK"
+                and marcador_xml.descricao_depois == "FRALDA GERIATRICA & CONFORT"
+                and marcador_xml.fonte == "XML etapa 40"
+                and bool(marcador_xml.registrado_em),
+                "itens_auditados guarda antes -> depois, fonte e data/hora",
+            )
+            _conferir(
+                (marcador_xml.chave_identificacao or "").startswith("XML_")
+                and not (marcador_xml.chave_identificacao or "").startswith("DESC_"),
+                "a chave da correção fica fora do mapa DESC_ usado pelos relatórios",
+            )
+            mapeamento_xml = (
+                db.query(MapeamentoFornecedorProduto)
+                .filter(MapeamentoFornecedorProduto.c_prod == "PRD00050")
+                .one()
+            )
+            _conferir(
+                mapeamento_xml.descricao_padrao == "FRALDA GERIATRICA & CONFORT"
+                and corrigida["descricoes"]["memoria_atualizada"] == 1,
+                "memória de-para passa a guardar a descrição do fornecedor",
+            )
+
+            # XML com a MESMA descrição da lista: nada muda (nem trilha, nem origem).
+            conferido = bsync.sincronizar_recebimentos(
+                db,
+                empresa,
+                dias=7,
+                cliente=ClienteFalso(
+                    {
+                        "40": [
+                            _recebimento(
+                                chave=CHAVE_XML_CONFERIDA,
+                                numero="000007777",
+                                valor=40.0,
+                                itens=[
+                                    _item(
+                                        codigo="FORN003",
+                                        descricao="ACUCAR REFINADO",
+                                        ean="7891234567890",
+                                        ncm="1701.99.00",
+                                        cfop="5.102",
+                                        unidade="UN",
+                                        quantidade=10.0,
+                                        preco=4.0,
+                                        total=40.0,
+                                    )
+                                ],
+                            )
+                        ]
+                    },
+                    documentos=[
+                        _documento_omie(
+                            CHAVE_XML_CONFERIDA,
+                            [
+                                {
+                                    "c_prod": "FORN003",
+                                    "xprod": "ACUCAR REFINADO",
+                                    "ean": "7891234567890",
+                                    "ncm": "1701.99.00",
+                                    "cfop": "5102",
+                                    "unidade": "UN",
+                                }
+                            ],
+                        )
+                    ],
+                ),
+                intervalo=0.0,
+            )
+            nota_conferida = (
+                db.query(NotaFiscal)
+                .filter(NotaFiscal.chave_acesso == CHAVE_XML_CONFERIDA)
+                .one()
+            )
+            item_conferido = (
+                db.query(ItemNota)
+                .filter(ItemNota.nota_id == nota_conferida.id)
+                .one()
+            )
+            _conferir(
+                conferido["descricoes"]["corrigidas"] == 0
+                and conferido["descricoes"]["conferidas"] == 1,
+                "descrição já igual ao xProd: conferida, sem correção",
+            )
+            _conferir(
+                item_conferido.descricao_produto == "ACUCAR REFINADO"
+                and item_conferido.descricao_origem is None
+                and item_conferido.descricao_produto_anterior is None
+                and not db.query(ItemAuditado)
+                .filter(
+                    ItemAuditado.chave_identificacao
+                    == f"XML_{CHAVE_XML_CONFERIDA}_1"
+                )
+                .first(),
+                "item correto não ganha origem/trilha (nada é sobrescrito)",
+            )
+
+            # Nota já gravada (dedupe) com PRD...: na execução seguinte o XML chega
+            # e corrige a linha existente — sem duplicar nota nem item.
+            recebimento_existente = _recebimento(
+                chave=CHAVE_XML_EXISTENTE,
+                numero="000008888",
+                valor=30.0,
+                itens=[
+                    _item(
+                        codigo="PRD00088",
+                        descricao="SKIRT STEAK",
+                        ean="7898925798125",
+                        ncm="0406.10.10",
+                        cfop="6.101",
+                        unidade="KG",
+                        quantidade=1.0,
+                        preco=30.0,
+                        total=30.0,
+                    )
+                ],
+            )
+            # 1ª execução sem XML: a nota entra com a descrição do cadastro interno.
+            bsync.sincronizar_recebimentos(
+                db,
+                empresa,
+                dias=7,
+                cliente=ClienteFalso({"40": [recebimento_existente]}),
+                intervalo=0.0,
+            )
+            # 2ª execução: a nota é duplicada, mas o XML corrige a linha gravada.
+            conserto = bsync.sincronizar_recebimentos(
+                db,
+                empresa,
+                dias=7,
+                cliente=ClienteFalso(
+                    {"40": [recebimento_existente]},
+                    documentos=[
+                        _documento_omie(
+                            CHAVE_XML_EXISTENTE,
+                            [
+                                {
+                                    "c_prod": "BACON-01",
+                                    "xprod": "BACON FATIADO PREMIUM",
+                                    "ean": "7898925798125",
+                                    "ncm": "0406.10.10",
+                                    "cfop": "6101",
+                                    "unidade": "KG",
+                                }
+                            ],
+                        )
+                    ],
+                ),
+                intervalo=0.0,
+            )
+            _conferir(
+                conserto["novas"] == 0
+                and conserto["duplicadas"] == 1
+                and conserto["descricoes"]["corrigidas"] == 1,
+                "nota já gravada com PRD... é corrigida na execução seguinte "
+                f"(dedupe mantido: {conserto['descricoes']})",
+            )
+            nota_existente = (
+                db.query(NotaFiscal)
+                .filter(NotaFiscal.chave_acesso == CHAVE_XML_EXISTENTE)
+                .one()
+            )
+            itens_existentes = (
+                db.query(ItemNota)
+                .filter(ItemNota.nota_id == nota_existente.id)
+                .all()
+            )
+            _conferir(
+                len(itens_existentes) == 1
+                and itens_existentes[0].descricao_produto == "BACON FATIADO PREMIUM"
+                and itens_existentes[0].descricao_produto_anterior == "SKIRT STEAK",
+                "descrição da nota já gravada foi corrigida pelo XML (sem duplicar item)",
+            )
+
+            print()
+            print("=" * 78)
+            print("8) CLI — --sem-marcas só é aceito junto de --simular")
             print("=" * 78)
             # Import tardio: o módulo do CLI lê o .env no import (load_dotenv sem
             # override), então ele só entra aqui, depois do ambiente de teste.

@@ -135,9 +135,9 @@ sistema_nfe_pro/
 
 - `usuarios`: conta, hash de senha, `is_admin`, segredo/estado do 2FA.
 - `empresas`: CNPJ, nomes, `usuario_id` (dono), dados públicos do certificado, fonte das notas (`fonte_notas` = `omie`/`certificado`), concordância SEFAZ (`cert_concordancia_em`/`cert_concordancia_por`), cursor `ultimo_nsu_acbr` e as credenciais Omie **cifradas** (`omie_app_key`/`omie_app_secret`) + `omie_sync_em` (última sincronização).
-- `fornecedores`, `notas_fiscais`, `itens_nota`: NF-e, itens crus e campos derivados (`cfop`, `marca`, `c_prod`, `unidade_compra`, `qtd_por_embalagem`, unidades/base).
+- `fornecedores`, `notas_fiscais`, `itens_nota`: NF-e, itens crus e campos derivados (`cfop`, `marca`, `c_prod`, `unidade_compra`, `qtd_por_embalagem`, unidades/base). `descricao_origem` diz se a descrição veio do XML da nota (`XML etapa 40`) e `descricao_produto_anterior` preserva o texto que estava gravado antes da correção.
 - `mapeamento_fornecedor_produtos`: memória de-para por CNPJ do fornecedor + `cProd`, com `origem` automática/manual.
-- `itens_auditados`: chave aprovada ou pendente (`auditado` + `motivo` manual/aberrante).
+- `itens_auditados`: chave aprovada ou pendente (`auditado` + `motivo` manual/aberrante). As correções de descrição pelo XML gravam `motivo=descricao_xml` com `descricao_antes`/`descricao_depois`/`fonte`/`registrado_em` (chave `XML_...`, fora do prefixo `DESC_` dos relatórios).
 - `regras_agrupamento`: regras `juntar` (grupo → grupo) e `mover` (descrição → grupo).
 - `sugestoes_correcao_ia`: sugestões pendentes/aprovadas/ignoradas.
 - `configuracoes_alerta`: preferências por conta (telefone, e-mail, canal, janela, lojas), tipos do relatório (`alerta_diario/semanal/mensal`), cursores de idempotência (`ultima_nota_*_id`) e marcadores de envio (`ultimo_envio_*`).
@@ -494,6 +494,18 @@ Arquivos novos/alterados nesta frente: `backend/main.py`, `backend/agendador.py`
 5. **Testes**: `tests/test_multitenancy_lojas.py` ganhou 5 casos (derivação da fonte e JSON sem segredo, concordância obrigatória + data/usuário, credencial Omie/403, exclusão limpando a concordância e cadastro com fonte Omie sem certificado); `tests/test_integridade_relatorios.py` marca o checkbox da concordância nos AppTests do cadastro. Fluxos de tela (painel Omie, troca para certificado, submit sem/com aceite e cadastro Omie) validados por AppTest temporário com a API mockada.
 
 Arquivos novos/alterados nesta frente: `frontend/app.py`, `backend/main.py`, `backend/models.py`, `backend/database.py`, `backend/certificados.py`, `tests/test_multitenancy_lojas.py`, `tests/test_omie_rotas.py`, `tests/test_integridade_relatorios.py` e este resumo.
+
+### Frente Omie — passo 3: descrição corrigida pelo XML da NF-e (25/11/2026)
+
+1. **Correção automática** (`backend/omie_sync.py`): na etapa 40 (Faturado) o XML da nota já está no serviço `DocumentosFiscais`, então a sincronização baixa o XML com `ListarDocumentos` (uma varredura por período, com cache) e usa o `xProd` do fornecedor. `cProd`/`xProd` são extraídos de `itens_do_xml` (aceita o `cXml` HTML-escapado do Omie, XML com/sem namespace e `&amp;amp;`).
+2. **Âncora de identidade**: EAN quando existe; senão fornecedor + `cProd`. O código interno `PRD...` **nunca** é âncora — a posição na nota só entra como último recurso, quando as duas listas têm o mesmo tamanho (e com EAN conflitante o par é descartado).
+3. **Gravação**: `itens_nota.descricao_produto` passa a ser o `xProd`, o texto antigo fica em `descricao_produto_anterior` e `descricao_origem` registra `XML etapa 40`. Cada mudança vira uma linha em `itens_auditados` (`XML_<chave>_<item>`, `auditado=True`, `motivo=descricao_xml`) com `descricao_antes`/`descricao_depois`/`fonte`/`registrado_em`.
+4. **Idempotência**: descrição já igual ao `xProd` não é reescrita; item já corrigido por XML (`descricao_origem`) não é sobrescrito de novo — em 60/80 o texto da listagem é só conferência. Notas já gravadas (dedupe) também são corrigidas quando têm código `PRD...` ou pendência `DIV_`/`VINC_`.
+5. **Memória de-para**: a descrição canônica do `fornecedor+cProd` acompanha a correção (exceto de-para `manual`), para a próxima nota não voltar com o texto errado.
+6. **Colunas novas** (migração aditiva idempotente em `init_db`): `itens_nota.descricao_produto_anterior`/`descricao_origem` e `itens_auditados.descricao_antes`/`descricao_depois`/`fonte`/`registrado_em`.
+7. **Testes**: `tests/test_omie_sync.py` ganhou o bloco 7 (parse do `cXml`, correção automática, descrição já correta sem mudança e correção de nota já gravada), com `ListarDocumentos` no cliente falso e as colunas novas na checagem da migração.
+
+Arquivos novos/alterados nesta frente: `backend/omie_sync.py`, `backend/models.py`, `backend/database.py`, `testar_omie_sync.py` (linha do resumo), `tests/test_omie_sync.py` e este resumo.
 
 ---
 

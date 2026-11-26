@@ -254,6 +254,12 @@ def _garantir_colunas_novas(conexao):
       atualizado_em: completam a tabela de de-para que já existia;
     - configuracoes_alerta.email / canal: preferência de destino dos alertas
       (WhatsApp, e-mail ou ambos). Registros antigos ficam no canal WhatsApp.
+    - itens_nota.descricao_produto_anterior / descricao_origem + itens_auditados.
+      descricao_antes/descricao_depois/fonte/registrado_em: correção automática da
+      descrição pelo XML da NF-e na etapa 40 (backend/omie_sync.py). A descrição do
+      fornecedor (xProd) substitui a do cadastro interno do Omie, o texto anterior
+      fica preservado no item e a trilha completa vai para ``itens_auditados``.
+      Nascem NULL: nada muda na base antiga até a próxima sincronização.
     - usuarios.email_verificado / email_verificado_em: confirmação do e-mail no cadastro
       (código de 6 dígitos). O ALTER usa DEFAULT 1 para as contas que já existiam
       continuarem entrando; contas NOVAS são gravadas com 0 pelo ORM (default=False).
@@ -382,6 +388,25 @@ def _garantir_colunas_novas(conexao):
     executar(
         "CREATE INDEX IF NOT EXISTS ix_itens_nota_c_prod ON itens_nota (c_prod)"
     )
+
+    # ── Correção da descrição pelo XML da NF-e (etapa 40) ──────────────────────
+    # A descrição do cadastro interno do Omie pode estar errada ("Skirt Steak" no
+    # lugar de "FRALDA"); a sincronização substitui pelo xProd do XML e guarda o
+    # texto anterior no próprio item. A trilha (antes -> depois, fonte, data/hora)
+    # fica em itens_auditados. Tudo TEXT e NULL na base antiga: a correção entra
+    # na próxima sincronização, sem migrar dados aqui.
+    for coluna in ("descricao_produto_anterior", "descricao_origem"):
+        if coluna not in _colunas(conexao, "itens_nota"):
+            executar(f"ALTER TABLE itens_nota ADD COLUMN {coluna} TEXT")
+
+    for coluna in (
+        "descricao_antes",
+        "descricao_depois",
+        "fonte",
+        "registrado_em",
+    ):
+        if coluna not in _colunas(conexao, "itens_auditados"):
+            executar(f"ALTER TABLE itens_auditados ADD COLUMN {coluna} TEXT")
 
     colunas_mapeamento = {
         "qtd_por_embalagem": "REAL",

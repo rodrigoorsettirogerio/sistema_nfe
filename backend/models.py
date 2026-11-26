@@ -146,6 +146,16 @@ class ItemNota(Base):
     fornecedor_id = Column(Integer, ForeignKey("fornecedores.id"))
     ean = Column(String, index=True)
     descricao_produto = Column(String)
+    # ── Correção da descrição pelo XML da nota (backend/omie_sync.py) ─────────────
+    # A listagem de recebimentos do Omie pode trazer a descrição do CADASTRO interno
+    # (ex.: "Skirt Steak" em vez de "FRALDA") por causa de vínculo manual errado. Na
+    # etapa 40 (Faturado) o xProd do XML da NF-e é a descrição do fornecedor e passa a
+    # ser gravado em `descricao_produto`; o texto que estava antes fica preservado em
+    # `descricao_produto_anterior` (a convenção de guardar o valor cru para auditoria).
+    # `descricao_origem` diz de onde veio a descrição ATUAL ("XML etapa 40") e é o que
+    # impede uma segunda sobrescrita quando a nota chega em 60/80 (só conferência).
+    descricao_produto_anterior = Column(String)
+    descricao_origem = Column(String)
     quantidade = Column(Float)
     valor_unitario = Column(Float)
     valor_total = Column(Float)
@@ -211,6 +221,15 @@ class ItemAuditado(Base):
     # Pendências "manual" saem dos relatórios; as "aberrante" continuam visíveis nas
     # tabelas marcadas com o alerta, para o auditor validar sem perder o dado de vista.
     motivo = Column(String, default="manual")
+    # ── Trilha das correções automáticas de descrição (backend/omie_sync.py) ──────
+    # Cada correção pelo xProd do XML da NF-e grava uma linha com ``auditado=True``
+    # (é registro histórico, não pendência) e chave ``XML_<chave_da_nota>_<item>`` —
+    # fora do prefixo ``DESC_``, então os relatórios não mudam por causa dela.
+    # `fonte` guarda a origem ("XML etapa 40") e `registrado_em` o ISO 8601 UTC.
+    descricao_antes = Column(String)
+    descricao_depois = Column(String)
+    fonte = Column(String)
+    registrado_em = Column(String)
 
 class RegraAgrupamento(Base):
     __tablename__ = "regras_agrupamento"
