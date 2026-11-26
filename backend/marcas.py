@@ -79,10 +79,12 @@ QUALIFICADORES = {
     "CREME", "IOGURTE", "SORVETE", "CHOCOLATE", "DOCE", "BOLO", "TORTA", "HAMBURGUER",
     "PICANHA", "ALCATRA", "COSTELA", "MAMINHA", "PATINHO", "LOMBO", "FILE", "FRALDA",
     "MEDALHAO", "ENTRANHA", "DIAPHRAGMA", "ANCHO", "COLITA", "CUADRIL", "BEEF", "OJO",
-    "SELECAO", "BLEND", "TIRA", "HUESO", "SIN", "COOPERBOI", "BOV",
+    "SELECAO", "BLEND", "TIRA", "HUESO", "SIN", "BOV",
     # Estado/origem/corte e abreviações que apareciam como "marca" na inferência
     # local: STEAK/ORIGEM/CAMPO descrevem o produto, KAL/PLAST são abreviação de
     # embalagem e DIAFRAGMA/ENTRANHA são cortes (os dois últimos já estão acima).
+    # COOPERBOI saiu daqui: é MARCA de carne (Cooperboi), não corte — como
+    # qualificador, "CARNE MOIDA COOPERBOI BLEND" ficava sem marca nenhuma.
     "STEAK", "ORIGEM", "KAL", "CAMPO", "PLAST",
 }
 

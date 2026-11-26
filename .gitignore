@@ -27,4 +27,7 @@ xmls/
 *.pid
 *.anterior
 
+# Backups exportados pelos scripts (marcas_ia, itens_nota...) — nunca versionar
+backups/
+
 

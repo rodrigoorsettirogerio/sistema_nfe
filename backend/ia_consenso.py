@@ -26,7 +26,6 @@ HTTP 502/503 — a tela mostra a mensagem e a auditoria continua funcionando sem
 import json
 import os
 import re
-import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -84,13 +83,21 @@ MARCAS_INVALIDAS = frozenset(
 )
 # Abreviações de marca que os fornecedores usam nas descrições (a NF-e não tem o
 # campo de marca). A expansão é determinística para não depender do humor da IA.
+# A chave pode ter mais de uma palavra ("J CUERVO"): `_completar_marca` compara o
+# nome inteiro e `_marca_na_descricao` procura a abreviação como frase, então
+# "TEQUILA J CUERVO SILVER" confirma a marca JOSE CUERVO sem gastar tokens.
 MARCAS_ABREVIACOES = {
     "FTA": "FANTA",
     "SCHW": "SCHWEPPES",
+    "J CUERVO": "JOSE CUERVO",
 }
 # Marcas reais que a IA vinha devolvendo como "SEM MARCA". A lista é uma trava
 # determinística: quando o nome aparece na descrição, ele é extraído mesmo que o
 # cache antigo tenha gravado "SEM MARCA" (o registro envenenado é apagado).
+# Ela também protege marcas que o vocabulário de produto barrava por engano:
+# COOPERBOI estava em QUALIFICADORES (como se fosse corte) e JOSE CUERVO só
+# aparecia abreviada ("J CUERVO" — ver MARCAS_ABREVIACOES). Nome desta lista nunca
+# é tratado como termo genérico por `_marca_invalida`.
 MARCAS_CONHECIDAS = {
     "SADIA": "SADIA",
     "SEARA": "SEARA",
@@ -100,6 +107,8 @@ MARCAS_CONHECIDAS = {
     "VILLA PIVA": "VILLA PIVA",
     "IPANEMA": "IPANEMA",
     "CEPERA": "CEPERA",
+    "COOPERBOI": "COOPERBOI",
+    "JOSE CUERVO": "JOSE CUERVO",
 }
 # Teto de segurança para o nome devolvido (não é uma descrição: é só a marca).
 MAXIMO_MARCA = 80
@@ -180,15 +189,24 @@ def _marca_invalida(nome) -> bool:
     """True para termos que nunca podem ser gravados como marca (REFOR, TRANSP...).
 
     A comparação ignora acento para a barreira também pegar COXÃO/ACÉM, que são cortes
-    de carne e não marcas.
+    de carne e não marcas. Uma marca COMPOSTA cai na mesma barreira quando TODAS as
+    palavras são genéricas/de produto ("PLAST PET", "VERDE CAMPO", "PRIME STEAK
+    ORIGEM"): empilhar termos genéricos não individualiza o item, e a resposta antiga
+    ficava no cache e voltava em todas as rodadas seguintes. Nome de
+    `MARCAS_CONHECIDAS` passa sempre — COOPERBOI e JOSE CUERVO são marcas reais e não
+    podem ser barradas só porque as palavras existem no vocabulário de produto.
     """
-    texto = _limpar_espacos(nome).upper()
-    sem_acento = "".join(
-        caractere
-        for caractere in unicodedata.normalize("NFKD", texto)
-        if not unicodedata.combining(caractere)
+    partes = _tokens_busca_marca(nome)
+    if not partes:
+        return False
+    chave = " ".join(partes)
+    if chave in _chaves_marcas_conhecidas():
+        return False
+    if chave in MARCAS_INVALIDAS:
+        return True
+    return len(partes) > 1 and all(
+        parte in _termos_genericos_de_marca() for parte in partes
     )
-    return sem_acento in MARCAS_INVALIDAS
 
 
 def _marca_entre_parenteses(descricao) -> str:
@@ -249,6 +267,10 @@ MINIMO_LETRAS_ALIAS_ISOLADO = 5
 # Cache de unidades/cortes/qualificadores de `backend.marcas` (import tardio para
 # este módulo continuar independente das regras de inferência por NCM).
 _TERMOS_DE_PRODUTO = None
+# Cache do vocabulário completo que nunca individualiza marca (ver
+# `_termos_genericos_de_marca`) e das chaves canônicas de `MARCAS_CONHECIDAS`.
+_TERMOS_GENERICOS_MARCA = None
+_CHAVES_MARCAS_CONHECIDAS = None
 
 
 def _termos_de_produto() -> frozenset:
@@ -261,6 +283,34 @@ def _termos_de_produto() -> frozenset:
             regras_marcas.QUALIFICADORES
         )
     return _TERMOS_DE_PRODUTO
+
+
+def _termos_genericos_de_marca() -> frozenset:
+    """Vocabulário que, sozinho, nunca individualiza uma marca.
+
+    União de `MARCAS_INVALIDAS`, `PALAVRAS_GENERICAS_DE_MARCA` e do vocabulário de
+    unidades/qualificadores/cortes de `backend.marcas`. É a base da trava de marca
+    COMPOSTA em `_marca_invalida`: "PLAST PET" e "VERDE CAMPO" são apenas termos
+    genéricos empilhados. Montado uma vez por processo.
+    """
+    global _TERMOS_GENERICOS_MARCA
+    if _TERMOS_GENERICOS_MARCA is None:
+        _TERMOS_GENERICOS_MARCA = (
+            frozenset(MARCAS_INVALIDAS)
+            | frozenset(PALAVRAS_GENERICAS_DE_MARCA)
+            | _termos_de_produto()
+        )
+    return _TERMOS_GENERICOS_MARCA
+
+
+def _chaves_marcas_conhecidas() -> frozenset:
+    """Nomes de `MARCAS_CONHECIDAS` na forma canônica (montado uma vez por processo)."""
+    global _CHAVES_MARCAS_CONHECIDAS
+    if _CHAVES_MARCAS_CONHECIDAS is None:
+        _CHAVES_MARCAS_CONHECIDAS = frozenset(
+            _chave_marca(nome) for nome in MARCAS_CONHECIDAS.values()
+        )
+    return _CHAVES_MARCAS_CONHECIDAS
 
 
 def _alias_isolado_valido(parte: str) -> bool:

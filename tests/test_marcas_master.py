@@ -289,6 +289,45 @@ def test_fallback_deepseek_grava_na_memoria():
         engine.dispose()
 
 
+def test_marca_composta_so_de_termos_genericos_e_invalida():
+    """Marca COMPOSTA é lixo quando TODAS as palavras são genéricas/de produto.
+
+    O cache antigo gravou "PLAST PET" (embalagem), "VERDE CAMPO" (estado/origem) e
+    "PRIME STEAK ORIGEM" (corte) como se fossem fabricante. A barreira só reconhecia
+    o termo ISOLADO, então a composta passava e voltava em todas as rodadas.
+    """
+    for marca in (
+        "PLAST PET",
+        "VERDE CAMPO",
+        "PRIME STEAK ORIGEM",
+        "ZERO KAL",
+        "IN NATURA",
+    ):
+        assert ia_consenso._marca_invalida(marca), marca
+    # Nome de `MARCAS_CONHECIDAS` nunca é barrado, mesmo com palavra de produto.
+    for marca in ("SADIA", "UNIAO", "COOPERBOI", "JOSE CUERVO"):
+        assert not ia_consenso._marca_invalida(marca), marca
+
+
+def test_cooperboi_e_marca_e_j_cuervo_e_abreviacao():
+    """COOPERBOI é marca de carne (saiu do vocabulário de corte) e "J CUERVO" expande."""
+    from backend import marcas as regras_marcas
+
+    assert "COOPERBOI" not in regras_marcas.QUALIFICADORES
+    assert (
+        regras_marcas.extrair_marca("CARNE MOIDA COOPERBOI BLEND 1KG", {"CARNE", "MOIDA"})
+        == "COOPERBOI"
+    )
+    assert ia_consenso._completar_marca("J CUERVO") == "JOSE CUERVO"
+    assert ia_consenso._marca_na_descricao(
+        "JOSE CUERVO", "TEQUILA J CUERVO SILVER 750 ML"
+    )
+    assert (
+        ia_consenso._marca_conhecida_na_descricao("TEQUILA JOSE CUERVO REPOSADO 750ML")
+        == "JOSE CUERVO"
+    )
+
+
 TESTS = [
     test_catalogo_master_idempotente,
     test_importar_marcas_novas_idempotente,
@@ -299,6 +338,8 @@ TESTS = [
     test_cache_sem_marca_e_corrigido_pelo_catalogo,
     test_fallback_deepseek_grava_na_memoria,
     test_resposta_da_ia_sem_confirmacao_vira_sem_marca,
+    test_marca_composta_so_de_termos_genericos_e_invalida,
+    test_cooperboi_e_marca_e_j_cuervo_e_abreviacao,
 ]
 
 
