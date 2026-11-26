@@ -3,7 +3,6 @@ Vigor
 Elegê
 Mococa
 Embaré
-Verde Campo
 Campo Largo
 Quatá
 Porto Alegre
@@ -54,7 +53,6 @@ Ovos Mantiqueira
 Ovos Pardinho
 DaColonia
 Queensberry
-Zero Kal
 Adocyl
 Linea
 Magro
@@ -190,7 +188,6 @@ PDV Print
 NZB
 Azure Pack
 Utiflash
-Plast Pet
 Prafesta
 Plastubos
 Kaulflex

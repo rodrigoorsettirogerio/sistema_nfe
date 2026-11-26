@@ -24,6 +24,14 @@ Fluxo seguro, nesta ordem:
 `itens_nota(id, marca)` junto para poder desfazer um recálculo. `--aplicar` aborta se
 não existir backup do dia com a MESMA contagem de linhas da tabela — DELETE nunca
 acontece sem rede de segurança.
+
+O catálogo tem o próprio fluxo: `--catalogo` troca `marcas_ia` por `marcas_master` e
+usa o MESMO critério (`_marca_invalida`) para achar lixo como "VERDE CAMPO" e
+"PLAST PET" que entraram por importação de lista. Os nomes também foram tirados de
+`marcas_novas.txt`, senão a próxima carga os traria de volta:
+    python limpar_cache_marcas.py --catalogo                     # relatório
+    python limpar_cache_marcas.py --catalogo --backup            # marcas_master_backup_AAAAMMDD + CSV
+    python limpar_cache_marcas.py --catalogo --backup --aplicar  # apaga os inválidos
 """
 
 import argparse
@@ -42,6 +50,7 @@ from backend.models import ItemNota, MarcaIA, MarcaMaster
 RAIZ = Path(__file__).resolve().parent
 PASTA_BACKUP = RAIZ / "backups"
 PREFIXO_TABELA_BACKUP = "marcas_ia_backup_"
+PREFIXO_TABELA_BACKUP_CATALOGO = "marcas_master_backup_"
 
 
 def _catalogo(sessao) -> frozenset:
@@ -121,9 +130,9 @@ def _relatorio(sessao, selecao) -> None:
         print(f"  {marca!r:<22} {quantidade:>3} | {motivo:<16} | ex.: {exemplo[:60]}")
 
 
-def _nome_tabela_backup(motor) -> str:
+def _nome_tabela_backup(motor, prefixo: str = PREFIXO_TABELA_BACKUP) -> str:
     """Nome livre no schema: ``marcas_ia_backup_AAAAMMDD`` (``_2``, ``_3`` se preciso)."""
-    base = f"{PREFIXO_TABELA_BACKUP}{datetime.now():%Y%m%d}"
+    base = f"{prefixo}{datetime.now():%Y%m%d}"
     inspetor = inspect(motor)
     nome, sufixo = base, 1
     while inspetor.has_table(nome):
@@ -181,16 +190,15 @@ def _backup(sessao) -> str:
     return nome
 
 
-def _garantir_backup(sessao) -> str:
-    """Devolve o backup de hoje com a contagem de `marcas_ia`; aborta se não houver."""
-    atual = sessao.query(func.count(MarcaIA.id)).scalar() or 0
+def _backup_do_dia(sessao, prefixo: str, tabela: str, atual: int, dica: str) -> str:
+    """Backup de HOJE de `tabela` com a contagem atual; aborta se não existir."""
     hoje = datetime.now().strftime("%Y%m%d")
     inspetor = inspect(sessao.get_bind())
     candidatos = sorted(
         (
             nome
             for nome in inspetor.get_table_names()
-            if nome.startswith(f"{PREFIXO_TABELA_BACKUP}{hoje}")
+            if nome.startswith(f"{prefixo}{hoje}")
         ),
         reverse=True,
     )
@@ -199,9 +207,20 @@ def _garantir_backup(sessao) -> str:
         if copia == atual:
             return nome
     raise SystemExit(
-        f"❌ Nenhum backup de hoje ({PREFIXO_TABELA_BACKUP}{hoje}*) tem {atual} "
-        "linha(s), igual a marcas_ia. Rode `python limpar_cache_marcas.py --backup` "
-        "antes de qualquer DELETE."
+        f"❌ Nenhum backup de hoje ({prefixo}{hoje}*) tem {atual} linha(s), igual a "
+        f"{tabela}. {dica}"
+    )
+
+
+def _garantir_backup(sessao) -> str:
+    """Devolve o backup de hoje com a contagem de `marcas_ia`; aborta se não houver."""
+    atual = sessao.query(func.count(MarcaIA.id)).scalar() or 0
+    return _backup_do_dia(
+        sessao,
+        PREFIXO_TABELA_BACKUP,
+        "marcas_ia",
+        atual,
+        "Rode `python limpar_cache_marcas.py --backup` antes de qualquer DELETE.",
     )
 
 
@@ -224,6 +243,91 @@ def _aplicar(sessao, selecao) -> int:
         f"marcas_ia: {antes} → {depois}"
     )
     return apagadas
+
+
+def _catalogo_invalido(sessao, manter=()) -> list:
+    """Registros de `marcas_master` que a barreira de marca considera lixo."""
+    preservar = {ia_consenso._chave_marca(nome) for nome in manter or ()}
+    return [
+        registro
+        for registro in sessao.query(MarcaMaster).order_by(MarcaMaster.nome_marca).all()
+        if ia_consenso._chave_marca(registro.nome_marca) not in preservar
+        and ia_consenso._marca_invalida(registro.nome_marca)
+    ]
+
+
+def _relatorio_catalogo(sessao, invalidos) -> None:
+    """Resumo de `marcas_master` e dos nomes que seriam apagados (só leitura)."""
+    total = sessao.query(func.count(MarcaMaster.id)).scalar() or 0
+    print(f"marcas_master: {total} registro(s) | inválidos a remover: {len(invalidos)}")
+    for registro in invalidos:
+        print(
+            f"  {registro.nome_marca!r:<18} id={registro.id:<5} "
+            f"categoria={registro.categoria or '-'}"
+        )
+
+
+def _backup_catalogo(sessao) -> str:
+    """Copia `marcas_master` para uma tabela no mesmo schema e exporta o CSV."""
+    motor = sessao.get_bind()
+    nome = _nome_tabela_backup(motor, PREFIXO_TABELA_BACKUP_CATALOGO)
+    sessao.execute(text(f'CREATE TABLE "{nome}" AS SELECT * FROM marcas_master'))
+    sessao.commit()
+    origem = sessao.query(func.count(MarcaMaster.id)).scalar() or 0
+    copia = sessao.execute(text(f'SELECT count(*) FROM "{nome}"')).scalar() or 0
+    if copia != origem:
+        raise SystemExit(
+            f"❌ Backup inconsistente: marcas_master tem {origem} registro(s) e "
+            f"{nome} ficou com {copia}. Nenhum DELETE será feito."
+        )
+    catalogo_csv = PASTA_BACKUP / f"marcas_master_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    exportadas = _exportar_csv(
+        catalogo_csv,
+        ["id", "nome_marca", "categoria"],
+        sessao.query(
+            MarcaMaster.id, MarcaMaster.nome_marca, MarcaMaster.categoria
+        ).all(),
+    )
+    print(
+        f"✅ Backup: tabela {nome} ({copia} registro(s), igual a marcas_master) | "
+        f"{exportadas} linha(s) em {catalogo_csv.name}"
+    )
+    return nome
+
+
+def _garantir_backup_catalogo(sessao) -> str:
+    """Devolve o backup de hoje com a contagem de `marcas_master`; aborta se não houver."""
+    atual = sessao.query(func.count(MarcaMaster.id)).scalar() or 0
+    return _backup_do_dia(
+        sessao,
+        PREFIXO_TABELA_BACKUP_CATALOGO,
+        "marcas_master",
+        atual,
+        "Rode `python limpar_cache_marcas.py --catalogo --backup` antes de qualquer "
+        "DELETE.",
+    )
+
+
+def _aplicar_catalogo(sessao, invalidos) -> int:
+    """Apaga os nomes inválidos do catálogo (exige backup do dia com a contagem atual)."""
+    backup = _garantir_backup_catalogo(sessao)
+    ids = [registro.id for registro in invalidos]
+    # Lido ANTES do commit: depois dele o objeto ORM fica expirado e o DELETE já
+    # removeu a linha, então qualquer acesso voltaria como ObjectDeletedError.
+    nomes = ", ".join(repr(registro.nome_marca) for registro in invalidos)
+    antes = sessao.query(func.count(MarcaMaster.id)).scalar() or 0
+    apagados = (
+        sessao.query(MarcaMaster)
+        .filter(MarcaMaster.id.in_(ids))
+        .delete(synchronize_session=False)
+    )
+    sessao.commit()
+    depois = sessao.query(func.count(MarcaMaster.id)).scalar() or 0
+    print(
+        f"🗑️  {apagados} registro(s) removido(s) ({nomes}) | "
+        f"marcas_master: {antes} → {depois} | backup preservado em {backup}"
+    )
+    return apagados
 
 
 def _recalcular(sessao, usar_ia: bool) -> None:
@@ -253,6 +357,11 @@ def main(argv=None) -> int:
             "Remove de marcas_ia as marcas genéricas/não verificáveis que envenenam "
             "o cache e, opcionalmente, reaplica itens_nota.marca."
         )
+    )
+    parser.add_argument(
+        "--catalogo",
+        action="store_true",
+        help="opera em marcas_master (catálogo) em vez do cache marcas_ia",
     )
     parser.add_argument(
         "--backup",
@@ -285,6 +394,31 @@ def main(argv=None) -> int:
 
     sessao = SessionLocal()
     try:
+        if args.catalogo:
+            if args.recalcular or args.usar_ia:
+                raise SystemExit(
+                    "❌ --recalcular/--usar-ia operam em itens_nota: rode sem --catalogo."
+                )
+            invalidos = _catalogo_invalido(sessao, args.manter)
+            _relatorio_catalogo(sessao, invalidos)
+            if not (args.backup or args.aplicar):
+                print(
+                    "\n(dry-run: nada foi gravado; use --backup e depois --aplicar)"
+                )
+                return 0
+            if args.backup:
+                _backup_catalogo(sessao)
+            if args.aplicar:
+                if not invalidos:
+                    print("\nNada a remover.")
+                else:
+                    _aplicar_catalogo(sessao, invalidos)
+                    restantes = _catalogo_invalido(sessao, args.manter)
+                    print(
+                        f"Conferência: {len(restantes)} registro(s) inválido(s) "
+                        "restante(s)."
+                    )
+            return 0
         selecao = _selecionar(sessao, args.manter)
         _relatorio(sessao, selecao)
         if not (args.backup or args.aplicar or args.recalcular):
